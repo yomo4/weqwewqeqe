@@ -84,8 +84,10 @@ def patch_apk(input_path, new_package):
     
     if os.path.exists(work_dir): shutil.rmtree(work_dir)
     
-    print("📦 Распаковка...")
-    subprocess.run(["apktool", "d", input_path, "-o", work_dir, "-f"], check=True)
+    print("📦 Распаковка (может занять несколько минут для больших APK)...")
+    subprocess.run(["apktool", "d", input_path, "-o", work_dir, "-f"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   env={**os.environ, "JAVA_OPTS": "-Xmx256m"})
     
     # Замена Package Name
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
@@ -99,7 +101,9 @@ def patch_apk(input_path, new_package):
     inject_security_measures(work_dir)
 
     print("🔨 Сборка...")
-    subprocess.run(["apktool", "b", work_dir, "-o", output_apk], check=True)
+    subprocess.run(["apktool", "b", work_dir, "-o", output_apk],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   env={**os.environ, "JAVA_OPTS": "-Xmx256m"})
 
     print("✍️ Подпись (V2/V3)...")
     subprocess.run([
