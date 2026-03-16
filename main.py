@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
+APKSIGNER_MAIN_CLASS = "com.android.apksigner.ApkSignerTool"
 
 load_dotenv(ENV_PATH)
 
@@ -37,6 +38,26 @@ def resolve_project_path(path_value):
     return os.path.abspath(os.path.join(BASE_DIR, expanded))
 
 
+def resolve_command_or_path(value, default=""):
+    cleaned = get_env(value, default) if value.isupper() else (value or "").strip()
+    if not cleaned:
+        return ""
+
+    if os.path.isabs(cleaned) or cleaned.startswith(".") or "/" in cleaned or "\\" in cleaned:
+        return resolve_project_path(cleaned)
+
+    return cleaned
+
+
+def guess_keystore_type(path_value):
+    suffix = os.path.splitext(path_value)[1].lower()
+    if suffix in {".jks", ".keystore"}:
+        return "JKS"
+    if suffix in {".p12", ".pfx", ".pkcs12"}:
+        return "PKCS12"
+    return ""
+
+
 # --- Settings ---
 API_TOKEN = get_env("BOT_TOKEN", "")
 SIGNER_PATH = resolve_project_path(get_env("SIGNER_PATH", "uber-apk-signer-1.3.0.jar"))
@@ -44,9 +65,14 @@ KS_PATH = resolve_project_path(get_env("KS_PATH", "my-release-key.jks"))
 KS_ALIAS = get_env("KS_ALIAS", "my-alias")
 KS_PASS = get_env("KS_PASS", "12345678", strip=False)
 KS_KEY_PASS = get_env("KS_KEY_PASS", KS_PASS, strip=False)
+KS_TYPE = get_env("KS_TYPE", guess_keystore_type(KS_PATH))
+KS_PASS_ENCODING = get_env("KS_PASS_ENCODING", "")
+ZIPALIGN_PATH = resolve_command_or_path("ZIPALIGN_PATH", "zipalign")
 JAVA_OPTS = get_env("JAVA_OPTS", "-Xmx256m")
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 TEMP_WORK_DIR = os.path.join(BASE_DIR, "temp_work")
+UNSIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-unsigned.apk")
+ALIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-aligned.apk")
 OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
 
 dp = Dispatcher()
@@ -68,7 +94,7 @@ def generate_random_string(length=10):
     return "".join(random.choice(letters) for _ in range(length))
 
 
-def normalize_cli_output(text, limit=1200):
+def normalize_cli_output(text, limit=1600):
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
@@ -100,6 +126,11 @@ def run_command(command, stage, *, env=None):
         raise StageError(stage, normalize_cli_output(details)) from exc
 
 
+def remove_file_if_exists(path):
+    if os.path.exists(path):
+        os.remove(path)
+
+
 def describe_secret_issues(env_name, value):
     issues = []
 
@@ -128,6 +159,16 @@ def build_keystore_troubleshooting(*, include_key_password=True):
         f"Проверьте, что используется именно этот keystore: '{KS_PATH}'.",
     ]
 
+    if KS_TYPE:
+        hints.append(f"Для подписи используется тип хранилища KS_TYPE={KS_TYPE}.")
+    else:
+        hints.append("Если это JKS-файл на Linux/новом Java, задайте KS_TYPE=JKS.")
+
+    if KS_PASS_ENCODING:
+        hints.append(f"Для подписи используется кодировка пароля KS_PASS_ENCODING={KS_PASS_ENCODING}.")
+    elif any(ord(char) > 127 for char in f"{KS_PASS}{KS_KEY_PASS}"):
+        hints.append("Если пароль содержит не-ASCII символы, попробуйте задать KS_PASS_ENCODING=utf-8.")
+
     hints.extend(describe_secret_issues("KS_PASS", KS_PASS))
 
     if include_key_password:
@@ -146,6 +187,33 @@ def format_keystore_error(summary, *, details="", include_key_password=True):
     return "\n".join(parts)
 
 
+def build_apksigner_command(input_apk, output_apk):
+    command = [
+        "java",
+        "-cp",
+        SIGNER_PATH,
+        APKSIGNER_MAIN_CLASS,
+        "sign",
+        "--ks",
+        KS_PATH,
+        "--ks-key-alias",
+        KS_ALIAS,
+        "--ks-pass",
+        f"pass:{KS_PASS}",
+        "--key-pass",
+        f"pass:{KS_KEY_PASS}",
+    ]
+
+    if KS_TYPE:
+        command.extend(["--ks-type", KS_TYPE])
+
+    if KS_PASS_ENCODING:
+        command.extend(["--pass-encoding", KS_PASS_ENCODING])
+
+    command.extend(["--out", output_apk, input_apk])
+    return command
+
+
 def validate_keystore():
     if not os.path.exists(KS_PATH):
         return
@@ -154,20 +222,21 @@ def validate_keystore():
     if not keytool_path:
         return
 
+    command = [
+        keytool_path,
+        "-list",
+        "-keystore",
+        KS_PATH,
+        "-alias",
+        KS_ALIAS,
+        "-storepass",
+        KS_PASS,
+    ]
+    if KS_TYPE:
+        command.extend(["-storetype", KS_TYPE])
+
     try:
-        run_command(
-            [
-                keytool_path,
-                "-list",
-                "-keystore",
-                KS_PATH,
-                "-alias",
-                KS_ALIAS,
-                "-storepass",
-                KS_PASS,
-            ],
-            "keystore-check",
-        )
+        run_command(command, "keystore-check")
     except StageError as exc:
         message = exc.details.lower()
         if "password was incorrect" in message or "keystore was tampered with" in message:
@@ -239,38 +308,28 @@ def inject_security_measures(work_dir):
             file.write(smali_content)
 
 
-def sign_apk(output_apk):
+def sign_apk(unsigned_apk, output_apk, *, env=None):
+    remove_file_if_exists(ALIGNED_APK_PATH)
+    remove_file_if_exists(output_apk)
+
+    run_command(
+        [ZIPALIGN_PATH, "-f", "-p", "4", unsigned_apk, ALIGNED_APK_PATH],
+        "zipalign",
+        env=env,
+    )
+
     try:
-        run_command(
-            [
-                "java",
-                "-jar",
-                SIGNER_PATH,
-                "--apks",
-                output_apk,
-                "--ks",
-                KS_PATH,
-                "--ksAlias",
-                KS_ALIAS,
-                "--ksPass",
-                f"pass:{KS_PASS}",
-                "--ksKeyPass",
-                f"pass:{KS_KEY_PASS}",
-                "--allowResign",
-                "--overwrite",
-            ],
-            "sign",
-        )
+        run_command(build_apksigner_command(ALIGNED_APK_PATH, output_apk), "sign", env=env)
     except StageError as exc:
         message = exc.details.lower()
-        if "password verification failed" in message or "keystore was tampered with" in message:
+        if "keystore was tampered with" in message or "password was incorrect" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
                     "Подписывающая утилита не смогла открыть keystore.",
                     details=exc.details,
                 )
             ) from exc
-        if "alias" in message and "does not exist" in message:
+        if "does not exist" in message and "alias" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
                     f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'.",
@@ -289,11 +348,13 @@ def sign_apk(output_apk):
 
 def patch_apk(input_path, new_package):
     work_dir = TEMP_WORK_DIR
-    output_apk = OUTPUT_APK_PATH
     java_env = {**os.environ, "JAVA_OPTS": JAVA_OPTS}
 
     if os.path.exists(work_dir):
         shutil.rmtree(work_dir)
+
+    for artifact in (UNSIGNED_APK_PATH, ALIGNED_APK_PATH, OUTPUT_APK_PATH):
+        remove_file_if_exists(artifact)
 
     print("📦 Распаковка (может занять несколько минут для больших APK)...")
     run_command(
@@ -315,15 +376,16 @@ def patch_apk(input_path, new_package):
 
     print("🔨 Сборка...")
     run_command(
-        ["apktool", "b", work_dir, "-o", output_apk],
+        ["apktool", "b", work_dir, "-o", UNSIGNED_APK_PATH],
         "build",
         env=java_env,
     )
 
+    print("📏 Zipalign...")
     print("✍️ Подпись (V2/V3)...")
-    sign_apk(output_apk)
+    sign_apk(UNSIGNED_APK_PATH, OUTPUT_APK_PATH, env=java_env)
 
-    return output_apk
+    return OUTPUT_APK_PATH
 
 
 def build_stage_message(error):
@@ -336,6 +398,11 @@ def build_stage_message(error):
         return (
             "❌ Не удалось собрать APK после изменений.\n\n"
             f"{error.details or 'Проверьте smali/manifest после модификации.'}"
+        )
+    if error.stage == "zipalign":
+        return (
+            "❌ Не удалось выровнять APK через zipalign.\n\n"
+            f"{error.details or 'Проверьте, что zipalign установлен и доступен в PATH.'}"
         )
     if error.stage == "sign":
         return (
@@ -385,6 +452,8 @@ async def handle_apk(message: types.Message):
             shutil.rmtree(TEMP_WORK_DIR)
         if os.path.exists(input_file):
             os.remove(input_file)
+        remove_file_if_exists(UNSIGNED_APK_PATH)
+        remove_file_if_exists(ALIGNED_APK_PATH)
 
 
 async def main():
@@ -393,21 +462,21 @@ async def main():
     if not API_TOKEN:
         errors.append(
             "[ТОКЕН]   Переменная BOT_TOKEN не задана.\n"
-            "          → Windows:   set BOT_TOKEN=ваш_токен\n"
-            "          → Linux/Mac: export BOT_TOKEN=ваш_токен"
+            "          -> Windows:   set BOT_TOKEN=ваш_токен\n"
+            "          -> Linux/Mac: export BOT_TOKEN=ваш_токен"
         )
 
     checks = [
         (
             SIGNER_PATH,
             "Скачайте uber-apk-signer:\n"
-            "          → https://github.com/patrickfav/uber-apk-signer/releases\n"
-            "          → Положите .jar рядом с main.py или задайте SIGNER_PATH",
+            "          -> https://github.com/patrickfav/uber-apk-signer/releases\n"
+            "          -> Положите .jar рядом с main.py или задайте SIGNER_PATH",
         ),
         (
             KS_PATH,
             "Создайте keystore или укажите путь через KS_PATH:\n"
-            "          → keytool -genkey -v -keystore my-release-key.jks "
+            "          -> keytool -genkey -v -keystore my-release-key.jks "
             "-alias my-alias -keyalg RSA -keysize 2048 -validity 10000 "
             "-storepass 12345678 -keypass 12345678",
         ),
@@ -421,13 +490,17 @@ async def main():
         (
             "apktool",
             "Установите apktool:\n"
-            "          → https://apktool.org/docs/install\n"
-            "          → Убедитесь, что 'apktool' доступен из командной строки.",
+            "          -> https://apktool.org/docs/install\n"
+            "          -> Убедитесь, что 'apktool' доступен из командной строки.",
+        ),
+        (
+            ZIPALIGN_PATH,
+            "Установите zipalign и добавьте его в PATH либо задайте ZIPALIGN_PATH.",
         ),
     ]
     for tool, hint in tools:
-        if not shutil.which(tool):
-            errors.append(f"[PATH]    '{tool}' не найден в PATH.\n          {hint}")
+        if not shutil.which(tool) and not os.path.exists(tool):
+            errors.append(f"[PATH]    '{tool}' не найден.\n          {hint}")
 
     if not errors:
         try:
@@ -436,7 +509,7 @@ async def main():
             errors.append(
                 "[KEYSTORE] Неверная конфигурация подписи.\n"
                 f"          {exc}\n"
-                "          → Проверьте KS_PATH, KS_ALIAS, KS_PASS и KS_KEY_PASS."
+                "          -> Проверьте KS_PATH, KS_ALIAS, KS_PASS, KS_KEY_PASS, KS_TYPE и KS_PASS_ENCODING."
             )
 
     if errors:
