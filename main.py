@@ -111,7 +111,8 @@ def patch_apk(input_path, new_package):
         "--apks", output_apk,
         "--ks", KS_PATH,
         "--ksAlias", KS_ALIAS,
-        "--ksPass", KS_PASS,
+        "--ksPass", f"pass:{KS_PASS}",
+        "--ksKeyPass", f"pass:{KS_PASS}",
         "--allowResign",
         "--overwrite"
     ], check=True)
