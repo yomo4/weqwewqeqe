@@ -6,21 +6,48 @@ import re
 import shutil
 import string
 import subprocess
+import unicodedata
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-# --- Настройки ---
-API_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SIGNER_PATH = os.getenv("SIGNER_PATH", "uber-apk-signer-1.3.0.jar")
-KS_PATH = os.getenv("KS_PATH", "my-release-key.jks")
-KS_ALIAS = os.getenv("KS_ALIAS", "my-alias")
-KS_PASS = os.getenv("KS_PASS", "12345678")
-KS_KEY_PASS = os.getenv("KS_KEY_PASS", KS_PASS)
-JAVA_OPTS = os.getenv("JAVA_OPTS", "-Xmx256m")
+load_dotenv(ENV_PATH)
+
+
+def get_env(name, default="", *, strip=True):
+    value = os.getenv(name)
+    if value is None:
+        value = default
+    return value.strip() if strip else value
+
+
+def resolve_project_path(path_value):
+    cleaned = (path_value or "").strip()
+    if not cleaned:
+        return ""
+
+    expanded = os.path.expandvars(os.path.expanduser(cleaned))
+    if os.path.isabs(expanded):
+        return expanded
+
+    return os.path.abspath(os.path.join(BASE_DIR, expanded))
+
+
+# --- Settings ---
+API_TOKEN = get_env("BOT_TOKEN", "")
+SIGNER_PATH = resolve_project_path(get_env("SIGNER_PATH", "uber-apk-signer-1.3.0.jar"))
+KS_PATH = resolve_project_path(get_env("KS_PATH", "my-release-key.jks"))
+KS_ALIAS = get_env("KS_ALIAS", "my-alias")
+KS_PASS = get_env("KS_PASS", "12345678", strip=False)
+KS_KEY_PASS = get_env("KS_KEY_PASS", KS_PASS, strip=False)
+JAVA_OPTS = get_env("JAVA_OPTS", "-Xmx256m")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+TEMP_WORK_DIR = os.path.join(BASE_DIR, "temp_work")
+OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
 
 dp = Dispatcher()
 
@@ -73,6 +100,52 @@ def run_command(command, stage, *, env=None):
         raise StageError(stage, normalize_cli_output(details)) from exc
 
 
+def describe_secret_issues(env_name, value):
+    issues = []
+
+    if value != value.strip():
+        issues.append(f"{env_name} содержит пробел в начале или в конце.")
+
+    invisible_codes = []
+    for char in value:
+        if char in {"\u00A0", "\u200B", "\u200C", "\u200D", "\uFEFF"}:
+            invisible_codes.append(f"U+{ord(char):04X}")
+            continue
+
+        if unicodedata.category(char) == "Cf":
+            invisible_codes.append(f"U+{ord(char):04X}")
+
+    if invisible_codes:
+        unique_codes = ", ".join(sorted(set(invisible_codes)))
+        issues.append(f"{env_name} содержит невидимые символы ({unique_codes}).")
+
+    return issues
+
+
+def build_keystore_troubleshooting(*, include_key_password=True):
+    hints = [
+        "Предупреждение про JKS и PKCS12 само по себе не является ошибкой: JKS старый, но рабочий формат.",
+        f"Проверьте, что используется именно этот keystore: '{KS_PATH}'.",
+    ]
+
+    hints.extend(describe_secret_issues("KS_PASS", KS_PASS))
+
+    if include_key_password:
+        hints.append(
+            "Если keytool принимает KS_PASS, а подпись все равно падает, проверьте отдельный пароль ключа KS_KEY_PASS."
+        )
+        hints.extend(describe_secret_issues("KS_KEY_PASS", KS_KEY_PASS))
+
+    return "\n".join(f"- {hint}" for hint in hints)
+
+
+def format_keystore_error(summary, *, details="", include_key_password=True):
+    parts = [summary, "", build_keystore_troubleshooting(include_key_password=include_key_password)]
+    if details:
+        parts.extend(["", f"Детали утилиты: {details}"])
+    return "\n".join(parts)
+
+
 def validate_keystore():
     if not os.path.exists(KS_PATH):
         return
@@ -99,16 +172,22 @@ def validate_keystore():
         message = exc.details.lower()
         if "password was incorrect" in message or "keystore was tampered with" in message:
             raise KeystoreConfigError(
-                "Не удалось открыть keystore. Проверьте KS_PASS и сам файл "
-                f"'{KS_PATH}'."
+                format_keystore_error(
+                    "Не удалось открыть keystore через keytool.",
+                    details=exc.details,
+                    include_key_password=False,
+                )
             ) from exc
         if "alias <" in message and "does not exist" in message:
             raise KeystoreConfigError(
-                f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'."
+                format_keystore_error(
+                    f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'.",
+                    details=exc.details,
+                    include_key_password=False,
+                )
             ) from exc
         raise KeystoreConfigError(
-            "Не удалось проверить keystore. "
-            f"Подробности: {exc.details or 'неизвестная ошибка'}"
+            format_keystore_error("Не удалось проверить keystore.", details=exc.details)
         ) from exc
 
 
@@ -186,23 +265,31 @@ def sign_apk(output_apk):
         message = exc.details.lower()
         if "password verification failed" in message or "keystore was tampered with" in message:
             raise KeystoreConfigError(
-                "Пароль keystore неверный. Укажите правильный KS_PASS "
-                f"для файла '{KS_PATH}'."
+                format_keystore_error(
+                    "Подписывающая утилита не смогла открыть keystore.",
+                    details=exc.details,
+                )
             ) from exc
         if "alias" in message and "does not exist" in message:
             raise KeystoreConfigError(
-                f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'."
+                format_keystore_error(
+                    f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'.",
+                    details=exc.details,
+                )
             ) from exc
         if "cannot recover key" in message or "failed to obtain key" in message:
             raise KeystoreConfigError(
-                "Пароль ключа неверный. Проверьте KS_KEY_PASS."
+                format_keystore_error(
+                    "Keystore открылся, но пароль ключа внутри него не подошел. Проверьте KS_KEY_PASS.",
+                    details=exc.details,
+                )
             ) from exc
         raise
 
 
 def patch_apk(input_path, new_package):
-    work_dir = "temp_work"
-    output_apk = "rebuilt_game.apk"
+    work_dir = TEMP_WORK_DIR
+    output_apk = OUTPUT_APK_PATH
     java_env = {**os.environ, "JAVA_OPTS": JAVA_OPTS}
 
     if os.path.exists(work_dir):
@@ -268,8 +355,9 @@ async def handle_apk(message: types.Message):
     )
 
     file_id = message.document.file_id
-    input_file = f"downloads/{message.document.file_name}"
-    os.makedirs("downloads", exist_ok=True)
+    input_name = os.path.basename(message.document.file_name)
+    input_file = os.path.join(DOWNLOADS_DIR, input_name)
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
     file = await message.bot.get_file(file_id)
     await message.bot.download_file(file.file_path, input_file)
@@ -293,8 +381,8 @@ async def handle_apk(message: types.Message):
     except Exception as exc:
         await message.answer(f"❌ Системная ошибка: {exc}")
     finally:
-        if os.path.exists("temp_work"):
-            shutil.rmtree("temp_work")
+        if os.path.exists(TEMP_WORK_DIR):
+            shutil.rmtree(TEMP_WORK_DIR)
         if os.path.exists(input_file):
             os.remove(input_file)
 
