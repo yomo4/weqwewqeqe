@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import string
+import struct
 import subprocess
 import tempfile
 import unicodedata
@@ -590,7 +591,267 @@ def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_packa
     ])
 
 
-def inject_security_measures(work_dir):
+def encrypt_dex_to_asset(work_dir):
+    """
+    Находит все classes*.dex в work_dir, шифрует каждый через AES-256-GCM + PBKDF2
+    и кладёт зашифрованный blob в assets/<имя>.dex.enc.
+
+    Формат blob (в порядке байт):
+        4 байта  — длина password (little-endian uint32)
+        N байт   — пароль (ASCII символы)
+        4 байта  — iterations PBKDF2 (little-endian uint32)
+        32 байта — PBKDF2-SHA256 salt
+        12 байт  — AES-GCM nonce (IV)
+        16 байт  — GCM auth-tag
+        M байт   — зашифрованный dex
+
+    Пароль и salt генерируются случайно per-file, iterations — 10000..20000.
+    Возвращает dict: dex_name -> (password_bytes, salt, iterations)
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.backends import default_backend
+    except ImportError as exc:
+        raise StageError(
+            "dex-encrypt",
+            "Библиотека 'cryptography' не установлена. "
+            "Запустите: pip install cryptography",
+        ) from exc
+
+    assets_dir = os.path.join(work_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    dex_meta = {}
+
+    for fname in sorted(os.listdir(work_dir)):
+        if not re.fullmatch(r"classes\d*\.dex", fname):
+            continue
+
+        dex_path = os.path.join(work_dir, fname)
+        with open(dex_path, "rb") as fh:
+            dex_data = fh.read()
+
+        password_bytes = os.urandom(24)           # 24 случайных байта → hex-пароль
+        password_hex = password_bytes.hex().encode("ascii")
+        salt = os.urandom(32)
+        iterations = random.randint(10_000, 20_000)
+        nonce = os.urandom(12)
+
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+            backend=default_backend(),
+        )
+        key = kdf.derive(password_hex)
+
+        aesgcm = AESGCM(key)
+        ciphertext_with_tag = aesgcm.encrypt(nonce, dex_data, None)
+        # AESGCM.encrypt возвращает ciphertext + 16-байтный tag в конце
+        ciphertext = ciphertext_with_tag[:-16]
+        tag = ciphertext_with_tag[-16:]
+
+        blob = (
+            struct.pack("<I", len(password_hex))
+            + password_hex
+            + struct.pack("<I", iterations)
+            + salt
+            + nonce
+            + tag
+            + ciphertext
+        )
+
+        enc_path = os.path.join(assets_dir, fname + ".enc")
+        with open(enc_path, "wb") as fh:
+            fh.write(blob)
+
+        os.remove(dex_path)
+        dex_meta[fname] = (password_hex, salt, iterations)
+        print(f"  🔐 {fname} → assets/{fname}.enc ({len(dex_data)} б → {len(blob)} б)")
+
+    return dex_meta
+
+
+def generate_dex_loader_smali(dex_meta):
+    """
+    Генерирует smali-класс com/app/internal/DexLoader.
+    Содержит по одному методу на каждый зашифрованный dex:
+      public static byte[] load<Name>() throws Exception
+    Метод:
+      1. Читает blob из raw-ресурса (assets) через AssetManager (передаётся параметром)
+      2. Парсит заголовок (длина пароля, iterations, salt, nonce, tag)
+      3. Прогоняет PBKDF2WithHmacSHA256 → 32-байтный ключ
+      4. Расшифровывает AES/GCM/NoPadding
+      5. Возвращает byte[]
+    """
+    lines = [
+        ".class public Lcom/app/internal/DexLoader;",
+        ".super Ljava/lang/Object;",
+        "",
+        ".method public constructor <init>()V",
+        "    .registers 1",
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+    ]
+
+    for dex_name, (password_hex, salt, iterations) in dex_meta.items():
+        asset_name = dex_name + ".enc"
+        method_name = "load" + dex_name.replace(".", "_").capitalize()
+        pw_bytes = list(password_hex)
+        pw_len = len(pw_bytes)
+        pw_array_data = "\n        ".join(f"0x{b:02x}" for b in password_hex)
+        salt_array_data = "\n        ".join(f"0x{b:02x}" for b in salt)
+
+        m = [
+            f".method public static {method_name}("
+            "Landroid/content/res/AssetManager;)[B",
+            "    .registers 18",
+            "",
+            "    # --- читаем asset ---",
+            f"    const-string v0, \"{asset_name}\"",
+            "    invoke-virtual {p0, v0}, "
+            "Landroid/content/res/AssetManager;"
+            "->open(Ljava/lang/String;)Ljava/io/InputStream;",
+            "    move-result-object v0",
+            "    invoke-virtual {v0}, "
+            "Ljava/io/InputStream;->readAllBytes()[B",
+            "    move-result-object v1",   # v1 = blob byte[]
+            "    invoke-virtual {v0}, "
+            "Ljava/io/InputStream;->close()V",
+            "",
+            "    # --- парсим заголовок: [0..3] = pw_len (LE) ---",
+            "    const/4 v2, 0x0",
+            "    aget-byte v3, v1, v2",
+            "    int-to-byte v3, v3",       # byte → int (unsigned via & 0xFF)
+            "    and-int/lit16 v3, v3, 0xFF",
+            "    const/4 v4, 0x1",
+            "    aget-byte v5, v1, v4",
+            "    and-int/lit16 v5, v5, 0xFF",
+            "    shl-int/lit8 v5, v5, 8",
+            "    or-int/2addr v3, v5",
+            "    const/4 v4, 0x2",
+            "    aget-byte v5, v1, v4",
+            "    and-int/lit16 v5, v5, 0xFF",
+            "    shl-int/lit8 v5, v5, 16",
+            "    or-int/2addr v3, v5",
+            "    const/4 v4, 0x3",
+            "    aget-byte v5, v1, v4",
+            "    and-int/lit16 v5, v5, 0xFF",
+            "    shl-int/lit8 v5, v5, 24",
+            "    or-int/2addr v3, v5",      # v3 = pw_len
+            "",
+            "    # --- извлекаем password bytes ---",
+            "    new-array v6, v3, [B",
+            "    const/4 v7, 0x4",
+            "    invoke-static {v1, v7, v6, v2, v3}, "
+            "Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            "",
+            "    # --- извлекаем iterations (4 байта после пароля) ---",
+            "    add-int v8, v7, v3",       # v8 = 4 + pw_len
+            "    aget-byte v5, v1, v8",
+            "    and-int/lit16 v5, v5, 0xFF",
+            "    add-int/lit8 v9, v8, 0x1",
+            "    aget-byte v10, v1, v9",
+            "    and-int/lit16 v10, v10, 0xFF",
+            "    shl-int/lit8 v10, v10, 8",
+            "    or-int/2addr v5, v10",
+            "    add-int/lit8 v9, v8, 0x2",
+            "    aget-byte v10, v1, v9",
+            "    and-int/lit16 v10, v10, 0xFF",
+            "    shl-int/lit8 v10, v10, 16",
+            "    or-int/2addr v5, v10",
+            "    add-int/lit8 v9, v8, 0x3",
+            "    aget-byte v10, v1, v9",
+            "    and-int/lit16 v10, v10, 0xFF",
+            "    shl-int/lit8 v10, v10, 24",
+            "    or-int/2addr v5, v10",     # v5 = iterations
+            "",
+            "    # --- salt (32 байта) ---",
+            "    const/16 v11, 0x20",
+            "    new-array v12, v11, [B",
+            "    add-int/lit8 v9, v8, 0x4",  # offset = 4+pw_len+4
+            "    invoke-static {v1, v9, v12, v2, v11}, "
+            "Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            "",
+            "    # --- nonce (12 байт) ---",
+            "    const/16 v13, 0x0C",
+            "    new-array v14, v13, [B",
+            "    add-int v9, v9, v11",      # offset += 32
+            "    invoke-static {v1, v9, v14, v2, v13}, "
+            "Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            "",
+            "    # --- tag+ciphertext (остаток = blob.length - offset - 12) ---",
+            "    add-int v9, v9, v13",      # offset += 12
+            "    array-length v15, v1",
+            "    sub-int v16, v15, v9",     # v16 = remaining length (tag+ct)
+            "    new-array v15, v16, [B",
+            "    invoke-static {v1, v9, v15, v2, v16}, "
+            "Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            "",
+            "    # --- PBKDF2 ---",
+            "    const-string v0, \"PBKDF2WithHmacSHA256\"",
+            "    invoke-static {v0}, "
+            "Ljavax/crypto/SecretKeyFactory;->getInstance("
+            "Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",
+            "    move-result-object v0",
+            "    const-string v17, \"AES\"",
+            "    new-instance v10, "
+            "Ljavax/crypto/spec/PBEKeySpec;",
+            "    invoke-static {v6}, "
+            "Ljava/lang/String;->valueOf([B)Ljava/lang/String;",  # pw bytes → String
+            "    move-result-object v11",
+            "    invoke-virtual {v11}, "
+            "Ljava/lang/String;->toCharArray()[C",
+            "    move-result-object v11",  # v11 = char[]
+            "    const/16 v13, 256",
+            "    invoke-direct {v10, v11, v12, v5, v13}, "
+            "Ljavax/crypto/spec/PBEKeySpec;-><init>([C[BII)V",
+            "    invoke-virtual {v0, v10}, "
+            "Ljavax/crypto/SecretKeyFactory;->generateSecret("
+            "Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+            "    move-result-object v0",
+            "    invoke-virtual {v0}, "
+            "Ljavax/crypto/SecretKey;->getEncoded()[B",
+            "    move-result-object v0",  # v0 = raw key bytes
+            "",
+            "    # --- AES/GCM/NoPadding ---",
+            "    new-instance v11, "
+            "Ljavax/crypto/spec/SecretKeySpec;",
+            "    invoke-direct {v11, v0, v17}, "
+            "Ljavax/crypto/spec/SecretKeySpec;-><init>([BLjava/lang/String;)V",
+            "    new-instance v12, "
+            "Ljavax/crypto/spec/GCMParameterSpec;",
+            "    const/16 v13, 128",       # tag size bits
+            "    invoke-direct {v12, v13, v14}, "
+            "Ljavax/crypto/spec/GCMParameterSpec;-><init>(I[B)V",
+            "    const-string v0, \"AES/GCM/NoPadding\"",
+            "    invoke-static {v0}, "
+            "Ljavax/crypto/Cipher;->getInstance("
+            "Ljava/lang/String;)Ljavax/crypto/Cipher;",
+            "    move-result-object v0",
+            "    sget v13, "
+            "Ljavax/crypto/Cipher;->DECRYPT_MODE:I",
+            "    invoke-virtual {v0, v13, v11, v12}, "
+            "Ljavax/crypto/Cipher;->init("
+            "ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+            "    invoke-virtual {v0, v15}, "
+            "Ljavax/crypto/Cipher;->doFinal([B)[B",
+            "    move-result-object v0",
+            "    return-object v0",
+            ".end method",
+            "",
+        ]
+        lines.extend(m)
+
+    return "\n".join(lines)
+
+
+
     print("Applying code hardening...")
 
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
@@ -695,6 +956,15 @@ def patch_apk(paths, new_package):
         file.write(data)
 
     inject_security_measures(work_dir)
+
+    print("🔐 Шифрование DEX → assets (AES-256-GCM + PBKDF2)...")
+    dex_meta = encrypt_dex_to_asset(work_dir)
+    if dex_meta:
+        loader_smali = generate_dex_loader_smali(dex_meta)
+        loader_dir = os.path.join(work_dir, "smali", "com", "app", "internal")
+        os.makedirs(loader_dir, exist_ok=True)
+        with open(os.path.join(loader_dir, "DexLoader.smali"), "w", encoding="utf-8") as fh:
+            fh.write(loader_smali)
 
     print("Rebuilding APK...")
     run_command(
