@@ -465,6 +465,16 @@ def _smali_array_data(byte_list):
     return "\n        ".join(f"0x{b:02x}" for b in byte_list)
 
 
+def _smali_const(register, value):
+    """Emit the narrowest valid smali const instruction for an int literal."""
+    literal = f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
+    if -8 <= value <= 7:
+        return f"    const/4 {register}, {literal}"
+    if -32768 <= value <= 32767:
+        return f"    const/16 {register}, {literal}"
+    return f"    const {register}, {literal}"
+
+
 # ---------------------------------------------------------------------------
 # Мусорные методы  (8 шаблонов, dead code)
 # ---------------------------------------------------------------------------
@@ -481,7 +491,7 @@ def _make_junk_method(name):
             "    .registers 3",
             f"    const/4 v0, 0x{a:01x}",
             "    shl-int/2addr p0, v0",
-            f"    const/4 v1, 0x{b:01x}",
+            _smali_const("v1", b),
             "    xor-int/2addr p0, v1",
             f"    const/4 v0, 0x{c:01x}",
             "    ushr-int/2addr p0, v0",
@@ -497,7 +507,7 @@ def _make_junk_method(name):
             "    .registers 3",
             f"    const/16 v0, 0x{a:02x}",
             "    and-int v1, p0, v0",
-            f"    const/4 v0, 0x{b:01x}",
+            _smali_const("v0", b),
             "    or-int/2addr v1, v0",
             "    return v1",
             ".end method",
@@ -664,7 +674,7 @@ def generate_poly_hierarchy_smali(smali_package):
         "\n".join([
             ".method public transform(I)I",
             "    .registers 3",
-            f"    const/4 v0, 0x{ma:01x}",
+            _smali_const("v0", ma),
             "    mul-int/2addr p1, v0",
             f"    const/4 v0, 0x{xa:01x}",
             "    xor-int/2addr p1, v0",
@@ -676,7 +686,7 @@ def generate_poly_hierarchy_smali(smali_package):
             "    .registers 3",
             f"    const/4 v0, 0x{sb:01x}",
             "    shl-int/2addr p1, v0",
-            f"    const/4 v0, 0x{ob:01x}",
+            _smali_const("v0", ob),
             "    or-int/2addr p1, v0",
             "    return p1",
             ".end method",
