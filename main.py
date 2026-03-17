@@ -851,6 +851,284 @@ def generate_dex_loader_smali(dex_meta):
     return "\n".join(lines)
 
 
+def generate_anti_debug_smali():
+    """
+    Генерирует smali-класс com/security/guard/AntiDebug с 10 анти-отладочными
+    проверками. Каждая проверка — публичный статический метод, возвращающий Z
+    (boolean): true = отладчик/эмулятор обнаружен.
+
+    Проверки:
+      1. isDebuggerConnected   — android.os.Debug.isDebuggerConnected()
+      2. isTracerPidSet        — /proc/self/status, поле TracerPid != 0
+      3. isEmulatorBuild       — Build.FINGERPRINT содержит "generic"/"emulator"
+      4. isEmulatorProduct     — Build.PRODUCT содержит "sdk"/"emulator"/"vbox"
+      5. hasDebugFlag          — ApplicationInfo.FLAG_DEBUGGABLE в flags
+      6. isRunningOnGenymotion — Build.MANUFACTURER == "Genymotion"
+      7. hasXposedInstalled    — проверка класса de.robv.android.xposed.XposedBridge
+      8. isAdbEnabled          — Settings.Global.ADB_ENABLED == 1
+      9. isTcpDumpRunning      — /proc/<pid>/maps содержит "tcpdump"
+     10. isHookFrameworkActive — поле Ljava/lang/Thread;->contextClassLoader изменён
+    """
+    cls = "Lcom/security/guard/AntiDebug;"
+
+    checks = []
+
+    # 1. isDebuggerConnected
+    checks.append("\n".join([
+        ".method public static isDebuggerConnected()Z",
+        "    .registers 1",
+        "    invoke-static {}, Landroid/os/Debug;->isDebuggerConnected()Z",
+        "    move-result v0",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 2. isTracerPidSet  (читаем /proc/self/status, ищем TracerPid)
+    checks.append("\n".join([
+        ".method public static isTracerPidSet()Z",
+        "    .registers 6",
+        "    const/4 v0, 0x0",
+        "    :try_start",
+        "    new-instance v1, Ljava/io/BufferedReader;",
+        "    new-instance v2, Ljava/io/FileReader;",
+        "    const-string v3, \"/proc/self/status\"",
+        "    invoke-direct {v2, v3}, Ljava/io/FileReader;-><init>(Ljava/lang/String;)V",
+        "    invoke-direct {v1, v2}, Ljava/io/BufferedReader;-><init>(Ljava/io/Reader;)V",
+        "    :loop",
+        "    invoke-virtual {v1}, Ljava/io/BufferedReader;->readLine()Ljava/lang/String;",
+        "    move-result-object v3",
+        "    if-eqz v3, :done",
+        "    const-string v4, \"TracerPid:\"",
+        "    invoke-virtual {v3, v4}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z",
+        "    move-result v4",
+        "    if-eqz v4, :loop",
+        "    const-string v4, \"TracerPid:\\t0\"",
+        "    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v4",
+        "    if-nez v4, :done",
+        "    const/4 v0, 0x1",
+        "    goto :done",
+        "    :done",
+        "    invoke-virtual {v1}, Ljava/io/BufferedReader;->close()V",
+        "    :try_end",
+        "    .catch Ljava/lang/Exception; {:try_start .. :try_end} :catch",
+        "    :catch",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 3. isEmulatorBuild  (Build.FINGERPRINT)
+    checks.append("\n".join([
+        ".method public static isEmulatorBuild()Z",
+        "    .registers 4",
+        "    sget-object v0, Landroid/os/Build;->FINGERPRINT:Ljava/lang/String;",
+        "    invoke-virtual {v0}, Ljava/lang/String;->toLowerCase()Ljava/lang/String;",
+        "    move-result-object v0",
+        "    const-string v1, \"generic\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const-string v1, \"emulator\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const-string v1, \"unknown\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const/4 v2, 0x0",
+        "    return v2",
+        "    :found",
+        "    const/4 v2, 0x1",
+        "    return v2",
+        ".end method",
+    ]))
+
+    # 4. isEmulatorProduct  (Build.PRODUCT)
+    checks.append("\n".join([
+        ".method public static isEmulatorProduct()Z",
+        "    .registers 4",
+        "    sget-object v0, Landroid/os/Build;->PRODUCT:Ljava/lang/String;",
+        "    invoke-virtual {v0}, Ljava/lang/String;->toLowerCase()Ljava/lang/String;",
+        "    move-result-object v0",
+        "    const-string v1, \"sdk\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const-string v1, \"emulator\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const-string v1, \"vbox\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v2",
+        "    if-nez v2, :found",
+        "    const/4 v2, 0x0",
+        "    return v2",
+        "    :found",
+        "    const/4 v2, 0x1",
+        "    return v2",
+        ".end method",
+    ]))
+
+    # 5. hasDebugFlag  (ApplicationInfo.FLAG_DEBUGGABLE)
+    checks.append("\n".join([
+        ".method public static hasDebugFlag(Landroid/content/Context;)Z",
+        "    .registers 4",
+        "    invoke-virtual {p0}, "
+        "Landroid/content/Context;->getApplicationInfo()"
+        "Landroid/content/pm/ApplicationInfo;",
+        "    move-result-object v0",
+        "    iget v1, v0, Landroid/content/pm/ApplicationInfo;->flags:I",
+        "    const/16 v2, 0x2",   # FLAG_DEBUGGABLE = 2
+        "    and-int/2addr v1, v2",
+        "    if-eqz v1, :clean",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        "    :clean",
+        "    const/4 v0, 0x0",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 6. isRunningOnGenymotion  (Build.MANUFACTURER)
+    checks.append("\n".join([
+        ".method public static isRunningOnGenymotion()Z",
+        "    .registers 3",
+        "    sget-object v0, Landroid/os/Build;->MANUFACTURER:Ljava/lang/String;",
+        "    const-string v1, \"Genymotion\"",
+        "    invoke-virtual {v0, v1}, Ljava/lang/String;->equalsIgnoreCase(Ljava/lang/String;)Z",
+        "    move-result v2",
+        "    return v2",
+        ".end method",
+    ]))
+
+    # 7. hasXposedInstalled  (загрузка класса XposedBridge)
+    checks.append("\n".join([
+        ".method public static hasXposedInstalled()Z",
+        "    .registers 3",
+        "    const/4 v0, 0x0",
+        "    :try_start",
+        "    const-string v1, \"de.robv.android.xposed.XposedBridge\"",
+        "    invoke-static {v1}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;",
+        "    const/4 v0, 0x1",
+        "    :try_end",
+        "    .catch Ljava/lang/ClassNotFoundException; {:try_start .. :try_end} :not_found",
+        "    :not_found",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 8. isAdbEnabled  (Settings.Global.ADB_ENABLED)
+    checks.append("\n".join([
+        ".method public static isAdbEnabled(Landroid/content/Context;)Z",
+        "    .registers 4",
+        "    :try_start",
+        "    invoke-virtual {p0}, "
+        "Landroid/content/Context;->getContentResolver()"
+        "Landroid/content/ContentResolver;",
+        "    move-result-object v0",
+        "    const-string v1, \"adb_enabled\"",
+        "    invoke-static {v0, v1}, "
+        "Landroid/provider/Settings$Global;->getInt("
+        "Landroid/content/ContentResolver;Ljava/lang/String;)I",
+        "    move-result v2",
+        "    if-eqz v2, :disabled",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        "    :disabled",
+        "    const/4 v0, 0x0",
+        "    return v0",
+        "    :try_end",
+        "    .catch Ljava/lang/Exception; {:try_start .. :try_end} :err",
+        "    :err",
+        "    const/4 v0, 0x0",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 9. isTcpDumpRunning  (/proc/self/maps содержит "tcpdump")
+    checks.append("\n".join([
+        ".method public static isTcpDumpRunning()Z",
+        "    .registers 5",
+        "    const/4 v0, 0x0",
+        "    :try_start",
+        "    new-instance v1, Ljava/io/BufferedReader;",
+        "    new-instance v2, Ljava/io/FileReader;",
+        "    const-string v3, \"/proc/self/maps\"",
+        "    invoke-direct {v2, v3}, Ljava/io/FileReader;-><init>(Ljava/lang/String;)V",
+        "    invoke-direct {v1, v2}, Ljava/io/BufferedReader;-><init>(Ljava/io/Reader;)V",
+        "    :loop",
+        "    invoke-virtual {v1}, Ljava/io/BufferedReader;->readLine()Ljava/lang/String;",
+        "    move-result-object v3",
+        "    if-eqz v3, :done",
+        "    const-string v4, \"tcpdump\"",
+        "    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v4",
+        "    if-eqz v4, :loop",
+        "    const/4 v0, 0x1",
+        "    goto :done",
+        "    :done",
+        "    invoke-virtual {v1}, Ljava/io/BufferedReader;->close()V",
+        "    :try_end",
+        "    .catch Ljava/lang/Exception; {:try_start .. :try_end} :catch",
+        "    :catch",
+        "    return v0",
+        ".end method",
+    ]))
+
+    # 10. isHookFrameworkActive  (проверяем стек вызовов на фреймы xposed/frida)
+    checks.append("\n".join([
+        ".method public static isHookFrameworkActive()Z",
+        "    .registers 5",
+        "    invoke-static {}, Ljava/lang/Thread;->currentThread()Ljava/lang/Thread;",
+        "    move-result-object v0",
+        "    invoke-virtual {v0}, Ljava/lang/Thread;->getStackTrace()[Ljava/lang/StackTraceElement;",
+        "    move-result-object v0",
+        "    array-length v1, v0",
+        "    const/4 v2, 0x0",
+        "    :loop",
+        "    if-ge v2, v1, :clean",
+        "    aget-object v3, v0, v2",
+        "    invoke-virtual {v3}, Ljava/lang/StackTraceElement;->getClassName()Ljava/lang/String;",
+        "    move-result-object v3",
+        "    invoke-virtual {v3}, Ljava/lang/String;->toLowerCase()Ljava/lang/String;",
+        "    move-result-object v3",
+        "    const-string v4, \"xposed\"",
+        "    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v4",
+        "    if-nez v4, :found",
+        "    const-string v4, \"frida\"",
+        "    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z",
+        "    move-result v4",
+        "    if-nez v4, :found",
+        "    add-int/lit8 v2, v2, 0x1",
+        "    goto :loop",
+        "    :found",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        "    :clean",
+        "    const/4 v0, 0x0",
+        "    return v0",
+        ".end method",
+    ]))
+
+    body = "\n\n".join(checks)
+    return "\n".join([
+        f".class public {cls}",
+        ".super Ljava/lang/Object;",
+        "",
+        ".method public constructor <init>()V",
+        "    .registers 1",
+        f"    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+        body,
+        "",
+    ])
+
+
 def inject_security_measures(work_dir):
     print("Applying code hardening...")
 
@@ -886,6 +1164,14 @@ def inject_security_measures(work_dir):
         smali_file = os.path.join(package_path, f"{class_name}.smali")
         with open(smali_file, "w", encoding="utf-8") as file:
             file.write(smali_content)
+
+    # --- AntiDebug класс (10 проверок) ---
+    anti_debug_dir = os.path.join(work_dir, "smali", "com", "security", "guard")
+    os.makedirs(anti_debug_dir, exist_ok=True)
+    anti_debug_path = os.path.join(anti_debug_dir, "AntiDebug.smali")
+    with open(anti_debug_path, "w", encoding="utf-8") as file:
+        file.write(generate_anti_debug_smali())
+    print("  🛡 AntiDebug.smali записан (10 проверок)")
 
 
 def sign_apk(unsigned_apk, aligned_apk, output_apk, *, env=None):
