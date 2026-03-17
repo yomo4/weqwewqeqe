@@ -454,7 +454,7 @@ async def handle_apk(message: types.Message):
         new_pkg = choose_random_package()
         result_path = await asyncio.to_thread(patch_apk, input_file, new_pkg)
         await message.answer_document(
-            FSInputFile(result_path),
+            FSInputFile(result_path, filename=input_name),
             caption=(
                 "✅ Готово!\n\n"
                 "🛡 Внедрен анти-дебаг\n"
