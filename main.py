@@ -851,7 +851,7 @@ def generate_dex_loader_smali(dex_meta):
     return "\n".join(lines)
 
 
-
+def inject_security_measures(work_dir):
     print("Applying code hardening...")
 
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
