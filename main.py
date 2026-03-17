@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import hashlib
 import os
 import random
 import re
@@ -24,6 +25,31 @@ def get_env(name, default="", *, strip=True):
     if value is None:
         value = default
     return value.strip() if strip else value
+
+
+def get_env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def get_env_apksigner_bool(name, default=""):
+    value = get_env(name, default)
+    normalized = value.lower()
+    if not normalized:
+        return ""
+    if normalized in {"1", "true", "yes", "on"}:
+        return "true"
+    if normalized in {"0", "false", "no", "off"}:
+        return "false"
+    return normalized
 
 
 def resolve_project_path(path_value):
@@ -67,6 +93,15 @@ KS_PASS = get_env("KS_PASS", "12345678", strip=False)
 KS_KEY_PASS = get_env("KS_KEY_PASS", KS_PASS, strip=False)
 KS_TYPE = get_env("KS_TYPE", guess_keystore_type(KS_PATH))
 KS_PASS_ENCODING = get_env("KS_PASS_ENCODING", "")
+SIGN_MIN_SDK_VERSION = get_env("SIGN_MIN_SDK_VERSION", "")
+SIGN_MAX_SDK_VERSION = get_env("SIGN_MAX_SDK_VERSION", "")
+SIGN_V1_ENABLED = get_env_apksigner_bool("SIGN_V1_ENABLED", "")
+SIGN_V2_ENABLED = get_env_apksigner_bool("SIGN_V2_ENABLED", "true")
+SIGN_V3_ENABLED = get_env_apksigner_bool("SIGN_V3_ENABLED", "true")
+SIGN_V4_ENABLED = get_env_apksigner_bool("SIGN_V4_ENABLED", "")
+SIGN_VERITY_ENABLED = get_env_apksigner_bool("SIGN_VERITY_ENABLED", "")
+REQUIRE_SHA256_KEYSTORE = get_env_bool("REQUIRE_SHA256_KEYSTORE", True)
+VERIFY_SIGNED_APK = get_env_bool("VERIFY_SIGNED_APK", True)
 ZIPALIGN_PATH = resolve_command_or_path("ZIPALIGN_PATH", "zipalign")
 JAVA_OPTS = get_env("JAVA_OPTS", "-Xmx256m")
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
@@ -133,6 +168,17 @@ def combine_process_output(stdout, stderr):
     return "\n".join(parts)
 
 
+def calculate_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while True:
+            chunk = file.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def run_command(command, stage, *, env=None):
     try:
         return subprocess.run(
@@ -145,6 +191,11 @@ def run_command(command, stage, *, env=None):
     except subprocess.CalledProcessError as exc:
         details = combine_process_output(exc.stdout, exc.stderr)
         raise StageError(stage, normalize_cli_output(details)) from exc
+
+
+def append_option_if_value(command, option_name, option_value):
+    if option_value != "":
+        command.extend([option_name, option_value])
 
 
 def remove_file_if_exists(path):
@@ -225,6 +276,14 @@ def build_apksigner_command(input_apk, output_apk):
         f"pass:{KS_KEY_PASS}",
     ]
 
+    append_option_if_value(command, "--min-sdk-version", SIGN_MIN_SDK_VERSION)
+    append_option_if_value(command, "--max-sdk-version", SIGN_MAX_SDK_VERSION)
+    append_option_if_value(command, "--v1-signing-enabled", SIGN_V1_ENABLED)
+    append_option_if_value(command, "--v2-signing-enabled", SIGN_V2_ENABLED)
+    append_option_if_value(command, "--v3-signing-enabled", SIGN_V3_ENABLED)
+    append_option_if_value(command, "--v4-signing-enabled", SIGN_V4_ENABLED)
+    append_option_if_value(command, "--verity-enabled", SIGN_VERITY_ENABLED)
+
     if KS_TYPE:
         command.extend(["--ks-type", KS_TYPE])
 
@@ -232,6 +291,22 @@ def build_apksigner_command(input_apk, output_apk):
         command.extend(["--pass-encoding", KS_PASS_ENCODING])
 
     command.extend(["--out", output_apk, input_apk])
+    return command
+
+
+def build_apksigner_verify_command(apk_path):
+    command = [
+        "java",
+        "-cp",
+        SIGNER_PATH,
+        APKSIGNER_MAIN_CLASS,
+        "verify",
+        "--verbose",
+        "--print-certs",
+    ]
+    append_option_if_value(command, "--min-sdk-version", SIGN_MIN_SDK_VERSION)
+    append_option_if_value(command, "--max-sdk-version", SIGN_MAX_SDK_VERSION)
+    command.append(apk_path)
     return command
 
 
@@ -246,6 +321,7 @@ def validate_keystore():
     command = [
         keytool_path,
         "-list",
+        "-v",
         "-keystore",
         KS_PATH,
         "-alias",
@@ -257,7 +333,7 @@ def validate_keystore():
         command.extend(["-storetype", KS_TYPE])
 
     try:
-        run_command(command, "keystore-check")
+        result = run_command(command, "keystore-check")
     except StageError as exc:
         message = exc.details.lower()
         if "password was incorrect" in message or "keystore was tampered with" in message:
@@ -279,6 +355,16 @@ def validate_keystore():
         raise KeystoreConfigError(
             format_keystore_error("Не удалось проверить keystore.", details=exc.details)
         ) from exc
+
+
+    if REQUIRE_SHA256_KEYSTORE:
+        details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
+        if "signaturealgorithmname:sha256" not in details:
+            raise KeystoreConfigError(
+                "Keystore certificate must use SHA-256. Recreate it with "
+                "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
+                "REQUIRE_SHA256_KEYSTORE."
+            )
 
 
 def inject_security_measures(work_dir):
@@ -366,6 +452,9 @@ def sign_apk(unsigned_apk, output_apk, *, env=None):
             ) from exc
         raise
 
+    if VERIFY_SIGNED_APK:
+        run_command(build_apksigner_verify_command(output_apk), "verify", env=env)
+
 
 def patch_apk(input_path, new_package):
     work_dir = TEMP_WORK_DIR
@@ -409,7 +498,7 @@ def patch_apk(input_path, new_package):
     return OUTPUT_APK_PATH
 
 
-def build_stage_message(error):
+def _legacy_build_stage_message(error):
     if error.stage == "decode":
         return (
             "❌ Не удалось распаковать APK через apktool.\n\n"
@@ -433,6 +522,42 @@ def build_stage_message(error):
     return f"❌ Ошибка на этапе '{error.stage}'.\n\n{error.details or 'Без деталей.'}"
 
 
+    if error.stage == "verify":
+        return (
+            "вќЊ РџРѕРґРїРёСЃР°РЅРЅС‹Р№ APK РЅРµ РїСЂРѕС€РµР» РїСЂРѕРІРµСЂРєСѓ apksigner.\n\n"
+            f"{error.details or 'РџСЂРѕРІРµСЂСЊС‚Рµ SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED Рё SIGN_MIN_SDK_VERSION.'}"
+        )
+
+
+def build_stage_message(error):
+    if error.stage == "decode":
+        return (
+            "APK decode failed.\n\n"
+            f"{error.details or 'Check that the input APK is valid and can be processed by apktool.'}"
+        )
+    if error.stage == "build":
+        return (
+            "APK rebuild failed.\n\n"
+            f"{error.details or 'Check smali and manifest changes after patching.'}"
+        )
+    if error.stage == "zipalign":
+        return (
+            "zipalign failed.\n\n"
+            f"{error.details or 'Check that zipalign is installed and available in PATH.'}"
+        )
+    if error.stage == "sign":
+        return (
+            "APK signing failed.\n\n"
+            f"{error.details or 'Check keystore configuration and signing options.'}"
+        )
+    if error.stage == "verify":
+        return (
+            "APK verification failed.\n\n"
+            f"{error.details or 'Check SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED and SIGN_MIN_SDK_VERSION.'}"
+        )
+    return f"Error at stage '{error.stage}'.\n\n{error.details or 'No details.'}"
+
+
 @dp.message(F.document)
 async def handle_apk(message: types.Message):
     if not message.document.file_name.endswith(".apk"):
@@ -453,9 +578,11 @@ async def handle_apk(message: types.Message):
     try:
         new_pkg = choose_random_package()
         result_path = await asyncio.to_thread(patch_apk, input_file, new_pkg)
+        result_sha256 = await asyncio.to_thread(calculate_sha256, result_path)
         await message.answer_document(
             FSInputFile(result_path, filename=input_name),
             caption=(
+                f"SHA-256: {result_sha256}\n"
                 "✅ Готово!\n\n"
                 "🛡 Внедрен анти-дебаг\n"
                 "🧬 Код мутирован (изменен DEX хеш)\n"
@@ -498,7 +625,7 @@ async def main():
             KS_PATH,
             "Создайте keystore или укажите путь через KS_PATH:\n"
             "          -> keytool -genkey -v -keystore my-release-key.jks "
-            "-alias my-alias -keyalg RSA -keysize 2048 -validity 10000 "
+            "-alias my-alias -keyalg RSA -sigalg SHA256withRSA -keysize 2048 -validity 10000 "
             "-storepass 12345678 -keypass 12345678",
         ),
     ]
