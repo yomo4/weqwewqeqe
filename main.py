@@ -105,6 +105,9 @@ SIGN_V4_ENABLED = get_env_apksigner_bool("SIGN_V4_ENABLED", "")
 SIGN_VERITY_ENABLED = get_env_apksigner_bool("SIGN_VERITY_ENABLED", "")
 REQUIRE_SHA256_KEYSTORE = get_env_bool("REQUIRE_SHA256_KEYSTORE", True)
 VERIFY_SIGNED_APK = get_env_bool("VERIFY_SIGNED_APK", True)
+ENABLE_EXPERIMENTAL_DEX_ASSET_ENCRYPTION = get_env_bool(
+    "ENABLE_EXPERIMENTAL_DEX_ASSET_ENCRYPTION", False
+)
 ZIPALIGN_PATH = resolve_command_or_path("ZIPALIGN_PATH", "zipalign")
 JAVA_OPTS = get_env("JAVA_OPTS", "-Xmx256m")
 REQUESTS_DIR = os.path.join(BASE_DIR, "requests")
@@ -186,6 +189,13 @@ class BuildPaths:
     output_apk_path: str
 
 
+@dataclass(frozen=True)
+class PatchOutcome:
+    output_apk_path: str
+    anti_debug_injected: bool
+    dex_asset_encryption_applied: bool
+
+
 def create_build_paths(input_name):
     safe_name = os.path.basename(input_name) or "input.apk"
     os.makedirs(REQUESTS_DIR, exist_ok=True)
@@ -238,6 +248,8 @@ def normalize_cli_output(text, limit=1600):
 def combine_process_output(stdout, stderr):
     parts = []
     for chunk in (stdout, stderr):
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", errors="replace")
         chunk = (chunk or "").strip()
         if chunk:
             parts.append(chunk)
@@ -279,6 +291,153 @@ def run_command(command, stage, *, env=None):
     except subprocess.CalledProcessError as exc:
         details = combine_process_output(exc.stdout, exc.stderr)
         raise StageError(stage, normalize_cli_output(details)) from exc
+
+
+def run_binary_command(command, stage, *, env=None):
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=False,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        executable = ""
+        if isinstance(command, (list, tuple)) and command:
+            executable = str(command[0])
+        elif isinstance(command, str):
+            executable = command.strip().split()[0]
+        else:
+            executable = str(command)
+
+        tool_name = os.path.basename(executable) or executable
+        details = f"Required command '{tool_name}' was not found. Check that it is installed and available in PATH."
+        raise StageError(stage, details) from exc
+    except subprocess.CalledProcessError as exc:
+        details = combine_process_output(exc.stdout, exc.stderr)
+        raise StageError(stage, normalize_cli_output(details)) from exc
+
+
+SHA256_SIGNATURE_ALGORITHM_OIDS = {
+    "1.2.840.113549.1.1.11",   # sha256WithRSAEncryption
+    "1.2.840.10045.4.3.2",     # ecdsa-with-SHA256
+    "2.16.840.1.101.3.4.3.2",  # dsa_with_sha256
+}
+SHA256_DIGEST_OID = "2.16.840.1.101.3.4.2.1"
+RSASSA_PSS_OID = "1.2.840.113549.1.1.10"
+
+
+def _read_der_length(data, offset):
+    if offset >= len(data):
+        raise ValueError("Unexpected end of DER input while reading length.")
+
+    first = data[offset]
+    offset += 1
+    if first < 0x80:
+        return first, offset
+
+    size = first & 0x7F
+    if size == 0 or size > 4:
+        raise ValueError("Unsupported DER length encoding.")
+    if offset + size > len(data):
+        raise ValueError("Truncated DER length.")
+
+    length = 0
+    for byte in data[offset:offset + size]:
+        length = (length << 8) | byte
+    return length, offset + size
+
+
+def _read_der_tlv(data, offset):
+    if offset >= len(data):
+        raise ValueError("Unexpected end of DER input while reading tag.")
+
+    tag = data[offset]
+    offset += 1
+    length, offset = _read_der_length(data, offset)
+    end = offset + length
+    if end > len(data):
+        raise ValueError("Truncated DER value.")
+    return tag, data[offset:end], end
+
+
+def _iter_der_children(data):
+    offset = 0
+    while offset < len(data):
+        tag, value, offset = _read_der_tlv(data, offset)
+        yield tag, value
+    if offset != len(data):
+        raise ValueError("Unexpected trailing DER data.")
+
+
+def _decode_der_oid(value):
+    if not value:
+        raise ValueError("OID value is empty.")
+
+    first = value[0]
+    if first < 80:
+        nodes = [first // 40, first % 40]
+    else:
+        nodes = [2, first - 80]
+
+    current = 0
+    for byte in value[1:]:
+        current = (current << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            nodes.append(current)
+            current = 0
+
+    if current:
+        raise ValueError("OID ended mid-component.")
+
+    return ".".join(str(node) for node in nodes)
+
+
+def _parse_algorithm_identifier(sequence_value):
+    children = list(_iter_der_children(sequence_value))
+    if not children or children[0][0] != 0x06:
+        raise ValueError("AlgorithmIdentifier does not start with an OID.")
+
+    oid = _decode_der_oid(children[0][1])
+    params = children[1] if len(children) > 1 else None
+    return oid, params
+
+
+def _parse_rsapss_hash_oid(params_value):
+    if not params_value:
+        return None
+
+    for tag, value in _iter_der_children(params_value):
+        if tag != 0xA0:
+            continue
+        inner_tag, inner_value, inner_end = _read_der_tlv(value, 0)
+        if inner_tag != 0x30 or inner_end != len(value):
+            raise ValueError("Invalid RSASSA-PSS hashAlgorithm encoding.")
+        hash_oid, _ = _parse_algorithm_identifier(inner_value)
+        return hash_oid
+    return None
+
+
+def certificate_uses_sha256_signature(cert_bytes):
+    tag, value, end = _read_der_tlv(cert_bytes, 0)
+    if tag != 0x30 or end != len(cert_bytes):
+        raise ValueError("Certificate is not a valid DER SEQUENCE.")
+
+    children = list(_iter_der_children(value))
+    if len(children) < 2 or children[1][0] != 0x30:
+        raise ValueError("Certificate signature algorithm is missing.")
+
+    signature_oid, params = _parse_algorithm_identifier(children[1][1])
+    if signature_oid in SHA256_SIGNATURE_ALGORITHM_OIDS:
+        return True
+
+    if signature_oid != RSASSA_PSS_OID:
+        return False
+    if params is None or params[0] != 0x30:
+        return False
+
+    return _parse_rsapss_hash_oid(params[1]) == SHA256_DIGEST_OID
 
 
 def append_option_if_value(command, option_name, option_value):
@@ -408,8 +567,7 @@ def validate_keystore():
 
     command = [
         keytool_path,
-        "-list",
-        "-v",
+        "-exportcert",
         "-keystore",
         KS_PATH,
         "-alias",
@@ -421,7 +579,7 @@ def validate_keystore():
         command.extend(["-storetype", KS_TYPE])
 
     try:
-        result = run_command(command, "keystore-check")
+        result = run_binary_command(command, "keystore-check")
     except StageError as exc:
         message = exc.details.lower()
         if "password was incorrect" in message or "keystore was tampered with" in message:
@@ -445,8 +603,14 @@ def validate_keystore():
         ) from exc
 
     if REQUIRE_SHA256_KEYSTORE:
-        details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
-        if "signaturealgorithmname:sha256" not in details:
+        try:
+            uses_sha256 = certificate_uses_sha256_signature(result.stdout)
+        except ValueError as exc:
+            raise KeystoreConfigError(
+                "Could not inspect the keystore certificate signature algorithm. "
+                f"Details: {exc}"
+            ) from exc
+        if not uses_sha256:
             raise KeystoreConfigError(
                 "The keystore certificate must use SHA-256. Regenerate it with "
                 "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
@@ -802,9 +966,10 @@ def generate_dex_loader_smali(dex_meta):
             "    const-string v17, \"AES\"",
             "    new-instance v10, "
             "Ljavax/crypto/spec/PBEKeySpec;",
-            "    invoke-static {v6}, "
-            "Ljava/lang/String;->valueOf([B)Ljava/lang/String;",  # pw bytes → String
-            "    move-result-object v11",
+            "    new-instance v11, "
+            "Ljava/lang/String;",
+            "    invoke-direct {v11, v6}, "
+            "Ljava/lang/String;-><init>([B)V",
             "    invoke-virtual {v11}, "
             "Ljava/lang/String;->toCharArray()[C",
             "    move-result-object v11",  # v11 = char[]
@@ -1129,23 +1294,155 @@ def generate_anti_debug_smali():
     ])
 
 
-def inject_security_measures(work_dir):
+def extract_manifest_package(manifest_data):
+    match = re.search(r'\bpackage="([^"]+)"', manifest_data)
+    return match.group(1) if match else ""
+
+
+def extract_application_name(manifest_data):
+    match = re.search(r"<application\b[^>]*\bandroid:name=\"([^\"]+)\"", manifest_data, re.S)
+    return match.group(1) if match else ""
+
+
+def resolve_android_class_name(class_name, package_name):
+    if not class_name:
+        return ""
+    if class_name.startswith("."):
+        return f"{package_name}{class_name}"
+    if "." not in class_name and package_name:
+        return f"{package_name}.{class_name}"
+    return class_name
+
+
+def descriptor_from_java_name(class_name):
+    return f"L{class_name.replace('.', '/')};"
+
+
+def replace_application_tag(manifest_data, *, set_attrs=None, remove_attrs=None):
+    match = re.search(r"<application\b[^>]*>", manifest_data, re.S)
+    if not match:
+        raise StageError("manifest", "AndroidManifest.xml does not contain an <application> tag.")
+
+    application_tag = match.group(0)
+    updated_tag = application_tag
+
+    for attr_name in remove_attrs or ():
+        updated_tag = re.sub(rf'\s+{re.escape(attr_name)}="[^"]*"', "", updated_tag)
+
+    for attr_name, attr_value in (set_attrs or {}).items():
+        replacement = f' {attr_name}="{attr_value}"'
+        attr_pattern = rf'\s+{re.escape(attr_name)}="[^"]*"'
+        if re.search(attr_pattern, updated_tag):
+            updated_tag = re.sub(attr_pattern, replacement, updated_tag, count=1)
+        elif updated_tag.endswith("/>"):
+            updated_tag = updated_tag[:-2] + replacement + "/>"
+        else:
+            updated_tag = updated_tag[:-1] + replacement + ">"
+
+    return manifest_data[:match.start()] + updated_tag + manifest_data[match.end():]
+
+
+def generate_guard_application_smali(super_class_name):
+    super_descriptor = descriptor_from_java_name(super_class_name)
+    cls = "Lcom/security/guard/GuardApplication;"
+
+    return "\n".join([
+        f".class public {cls}",
+        f".super {super_descriptor}",
+        "",
+        ".method public constructor <init>()V",
+        "    .registers 1",
+        f"    invoke-direct {{p0}}, {super_descriptor}-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static shouldBlock(Landroid/content/Context;)Z",
+        "    .registers 2",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isDebuggerConnected()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isTracerPidSet()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isEmulatorBuild()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isEmulatorProduct()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {p0}, Lcom/security/guard/AntiDebug;->hasDebugFlag(Landroid/content/Context;)Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isRunningOnGenymotion()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->hasXposedInstalled()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {p0}, Lcom/security/guard/AntiDebug;->isAdbEnabled(Landroid/content/Context;)Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isTcpDumpRunning()Z",
+        "    move-result v0",
+        "    if-nez v0, :blocked",
+        "    invoke-static {}, Lcom/security/guard/AntiDebug;->isHookFrameworkActive()Z",
+        "    move-result v0",
+        "    return v0",
+        "    :blocked",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        ".end method",
+        "",
+        ".method private static abort()V",
+        "    .registers 1",
+        "    invoke-static {}, Landroid/os/Process;->myPid()I",
+        "    move-result v0",
+        "    invoke-static {v0}, Landroid/os/Process;->killProcess(I)V",
+        "    const/4 v0, 0x0",
+        "    invoke-static {v0}, Ljava/lang/System;->exit(I)V",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public onCreate()V",
+        "    .registers 2",
+        f"    invoke-super {{p0}}, {super_descriptor}->onCreate()V",
+        "    invoke-static {p0}, Lcom/security/guard/GuardApplication;->shouldBlock(Landroid/content/Context;)Z",
+        "    move-result v0",
+        "    if-eqz v0, :clean",
+        "    invoke-static {}, Lcom/security/guard/GuardApplication;->abort()V",
+        "    :clean",
+        "    return-void",
+        ".end method",
+        "",
+    ])
+
+
+def inject_security_measures(work_dir, *, original_package, original_application_name):
     print("Applying code hardening...")
 
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
+    anti_debug_injected = False
     if os.path.exists(manifest):
         with open(manifest, "r", encoding="utf-8") as file:
             data = file.read()
 
-        data = re.sub(r'android:debuggable="(true|false)"', "", data)
-        data = re.sub(r'android:allowBackup="(true|false)"', "", data)
-        data = data.replace(
-            "<application",
-            '<application android:debuggable="false" android:allowBackup="false"',
+        original_application_class = resolve_android_class_name(
+            original_application_name, original_package
+        ) or "android.app.Application"
+        data = replace_application_tag(
+            data,
+            remove_attrs=("android:debuggable", "android:allowBackup"),
+            set_attrs={
+                "android:debuggable": "false",
+                "android:allowBackup": "false",
+                "android:name": "com.security.guard.GuardApplication",
+            },
         )
 
         with open(manifest, "w", encoding="utf-8") as file:
             file.write(data)
+    else:
+        original_application_class = "android.app.Application"
 
     for _ in range(10):
         smali_package = random.choice(FAKE_SMALI_PACKAGES)
@@ -1171,7 +1468,13 @@ def inject_security_measures(work_dir):
     anti_debug_path = os.path.join(anti_debug_dir, "AntiDebug.smali")
     with open(anti_debug_path, "w", encoding="utf-8") as file:
         file.write(generate_anti_debug_smali())
-    print("  🛡 AntiDebug.smali записан (10 проверок)")
+    bootstrap_path = os.path.join(anti_debug_dir, "GuardApplication.smali")
+    with open(bootstrap_path, "w", encoding="utf-8") as file:
+        file.write(generate_guard_application_smali(original_application_class))
+    anti_debug_injected = True
+    print("  🛡 Anti-debug bootstrap injected into Application.onCreate()")
+
+    return anti_debug_injected
 
 
 def sign_apk(unsigned_apk, aligned_apk, output_apk, *, env=None):
@@ -1236,21 +1539,25 @@ def patch_apk(paths, new_package):
     with open(manifest, "r", encoding="utf-8") as file:
         data = file.read()
 
+    original_package = extract_manifest_package(data)
+    original_application_name = extract_application_name(data)
     data = re.sub(r'package="[^"]+"', f'package="{new_package}"', data)
 
     with open(manifest, "w", encoding="utf-8") as file:
         file.write(data)
 
-    inject_security_measures(work_dir)
+    anti_debug_injected = inject_security_measures(
+        work_dir,
+        original_package=original_package,
+        original_application_name=original_application_name,
+    )
 
-    print("🔐 Шифрование DEX → assets (AES-256-GCM + PBKDF2)...")
-    dex_meta = encrypt_dex_to_asset(work_dir)
-    if dex_meta:
-        loader_smali = generate_dex_loader_smali(dex_meta)
-        loader_dir = os.path.join(work_dir, "smali", "com", "app", "internal")
-        os.makedirs(loader_dir, exist_ok=True)
-        with open(os.path.join(loader_dir, "DexLoader.smali"), "w", encoding="utf-8") as fh:
-            fh.write(loader_smali)
+    dex_asset_encryption_applied = False
+    if ENABLE_EXPERIMENTAL_DEX_ASSET_ENCRYPTION:
+        print(
+            "Warning: skipping experimental DEX asset encryption: the generated loader "
+            "is not wired into the app startup path yet."
+        )
 
     print("Rebuilding APK...")
     run_command(
@@ -1263,7 +1570,11 @@ def patch_apk(paths, new_package):
     print("Signing APK (V2/V3)...")
     sign_apk(paths.unsigned_apk_path, paths.aligned_apk_path, paths.output_apk_path, env=java_env)
 
-    return paths.output_apk_path
+    return PatchOutcome(
+        output_apk_path=paths.output_apk_path,
+        anti_debug_injected=anti_debug_injected,
+        dex_asset_encryption_applied=dex_asset_encryption_applied,
+    )
 
 
 def build_stage_message(error):
@@ -1276,6 +1587,11 @@ def build_stage_message(error):
         return (
             "APK rebuild failed.\n\n"
             f"{error.details or 'Check smali and manifest changes after patching.'}"
+        )
+    if error.stage == "manifest":
+        return (
+            "Manifest patching failed.\n\n"
+            f"{error.details or 'Check AndroidManifest.xml after package and application updates.'}"
         )
     if error.stage == "zipalign":
         return (
@@ -1314,17 +1630,26 @@ async def handle_apk(message: types.Message):
         await message.bot.download_file(file.file_path, paths.input_file)
 
         new_pkg = choose_random_package()
-        result_path = await asyncio.to_thread(patch_apk, paths, new_pkg)
-        result_sha256 = await asyncio.to_thread(calculate_sha256, result_path)
-        await message.answer_document(
-            FSInputFile(result_path, filename=input_name),
-            caption=(
-                f"SHA-256: {result_sha256}\n"
-                "Done.\n\n"
-                "Injected anti-debug hardening\n"
-                "Mutated code paths (DEX hash changed)\n"
-                f"New package name: {new_pkg}"
+        outcome = await asyncio.to_thread(patch_apk, paths, new_pkg)
+        result_sha256 = await asyncio.to_thread(calculate_sha256, outcome.output_apk_path)
+        status_lines = [
+            f"SHA-256: {result_sha256}",
+            "Done.",
+            "",
+            (
+                "Injected anti-debug hardening"
+                if outcome.anti_debug_injected
+                else "Skipped anti-debug hardening"
             ),
+        ]
+        if outcome.dex_asset_encryption_applied:
+            status_lines.append("Encrypted DEX into assets")
+        elif ENABLE_EXPERIMENTAL_DEX_ASSET_ENCRYPTION:
+            status_lines.append("Skipped experimental DEX asset encryption")
+        status_lines.append(f"New package name: {new_pkg}")
+        await message.answer_document(
+            FSInputFile(outcome.output_apk_path, filename=input_name),
+            caption="\n".join(status_lines),
         )
     except KeystoreConfigError as exc:
         await message.answer(f"Keystore error:\n\n{exc}")
