@@ -127,6 +127,19 @@ PACKAGE_CHOICES = [
     "ru.ozon.app.android",
 ]
 
+FAKE_STRINGS = [
+    "android.permission.INTERNET",
+    "android.permission.READ_PHONE_STATE",
+    "com.google.firebase.analytics",
+    "android.app.NotificationManager",
+    "javax.net.ssl.TrustManagerFactory",
+    "android.hardware.camera2.CameraManager",
+    "com.android.internal.util.Preconditions",
+    "android.os.Build.VERSION.SDK_INT",
+    "android.content.pm.PackageManager",
+    "android.telephony.TelephonyManager",
+]
+
 dp = Dispatcher()
 
 
@@ -361,10 +374,70 @@ def validate_keystore():
         details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
         if "signaturealgorithmname:sha256" not in details:
             raise KeystoreConfigError(
-                "Keystore certificate must use SHA-256. Recreate it with "
-                "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
+                "Сертификат keystore должен использовать SHA-256. Пересоздайте его командой "
+                "'keytool -genkey -sigalg SHA256withRSA ...' или отключите "
                 "REQUIRE_SHA256_KEYSTORE."
             )
+
+
+def xor_encrypt_bytes(text, key):
+    """XOR-encrypt a UTF-8 string with a per-class single-byte key."""
+    return [b ^ key for b in text.encode("utf-8")]
+
+
+def generate_encrypted_smali(class_name, method_name, fake_string, key):
+    """Return smali source for a class that stores an XOR-encrypted string
+    and exposes a static decrypt() method that reconstructs it at runtime."""
+    encrypted = xor_encrypt_bytes(fake_string, key)
+    length = len(encrypted)
+    byte_data = "\n        ".join(f"0x{b:02x}" for b in encrypted)
+    class_ref = f"Lcom/security/guard/{class_name};"
+    return (
+        f".class public {class_ref}\n"
+        f".super Ljava/lang/Object;\n"
+        f"\n"
+        f".field private static final ENCRYPTED:[B\n"
+        f"\n"
+        f".method static constructor <clinit>()V\n"
+        f"    .registers 2\n"
+        f"    const/16 v0, {length}\n"
+        f"    new-array v0, v0, [B\n"
+        f"    fill-array-data v0, :enc_data\n"
+        f"    sput-object v0, {class_ref}->ENCRYPTED:[B\n"
+        f"    return-void\n"
+        f"\n"
+        f"    :enc_data\n"
+        f"    .array-data 1\n"
+        f"        {byte_data}\n"
+        f"    .end array-data\n"
+        f".end method\n"
+        f"\n"
+        f".method public constructor <init>()V\n"
+        f"    .registers 1\n"
+        f"    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V\n"
+        f"    return-void\n"
+        f".end method\n"
+        f"\n"
+        f"# XOR key: 0x{key:02x}  (per-class, embedded in decrypt method)\n"
+        f".method public static {method_name}()[B\n"
+        f"    .registers 6\n"
+        f"    sget-object v0, {class_ref}->ENCRYPTED:[B\n"
+        f"    array-length v1, v0\n"
+        f"    new-array v2, v1, [B\n"
+        f"    const/4 v3, 0x0\n"
+        f"    const/16 v4, 0x{key:02x}\n"
+        f"    :loop\n"
+        f"    if-ge v3, v1, :end\n"
+        f"    aget-byte v5, v0, v3\n"
+        f"    xor-int/2addr v5, v4\n"
+        f"    int-to-byte v5, v5\n"
+        f"    aput-byte v5, v2, v3\n"
+        f"    add-int/lit8 v3, v3, 0x1\n"
+        f"    goto :loop\n"
+        f"    :end\n"
+        f"    return-object v2\n"
+        f".end method\n"
+    )
 
 
 def inject_security_measures(work_dir):
@@ -391,25 +464,10 @@ def inject_security_measures(work_dir):
     for _ in range(5):
         class_name = generate_random_string(8)
         method_name = generate_random_string(6)
+        key = random.randint(1, 255)
+        fake_string = random.choice(FAKE_STRINGS)
 
-        smali_content = f"""
-.class public Lcom/security/guard/{class_name};
-.super Ljava/lang/Object;
-
-.method public constructor <init>()V
-    .registers 1
-    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
-    return-void
-.end method
-
-.method public static {method_name}()I
-    .registers 2
-    const/4 v0, 0x1
-    const/4 v1, 0x0
-    add-int/2addr v0, v1
-    return v0
-.end method
-"""
+        smali_content = generate_encrypted_smali(class_name, method_name, fake_string, key)
         smali_file = os.path.join(fake_package_path, f"{class_name}.smali")
         with open(smali_file, "w", encoding="utf-8") as file:
             file.write(smali_content)
@@ -532,30 +590,30 @@ def _legacy_build_stage_message(error):
 def build_stage_message(error):
     if error.stage == "decode":
         return (
-            "APK decode failed.\n\n"
-            f"{error.details or 'Check that the input APK is valid and can be processed by apktool.'}"
+            "❌ Не удалось распаковать APK через apktool.\n\n"
+            f"{error.details or 'Проверьте, что файл не повреждён и может быть обработан apktool.'}"
         )
     if error.stage == "build":
         return (
-            "APK rebuild failed.\n\n"
-            f"{error.details or 'Check smali and manifest changes after patching.'}"
+            "❌ Не удалось пересобрать APK.\n\n"
+            f"{error.details or 'Проверьте изменения smali и манифеста после патчинга.'}"
         )
     if error.stage == "zipalign":
         return (
-            "zipalign failed.\n\n"
-            f"{error.details or 'Check that zipalign is installed and available in PATH.'}"
+            "❌ Не удалось выровнять APK через zipalign.\n\n"
+            f"{error.details or 'Проверьте, что zipalign установлен и доступен в PATH.'}"
         )
     if error.stage == "sign":
         return (
-            "APK signing failed.\n\n"
-            f"{error.details or 'Check keystore configuration and signing options.'}"
+            "❌ Не удалось подписать APK.\n\n"
+            f"{error.details or 'Проверьте конфигурацию keystore и параметры подписи.'}"
         )
     if error.stage == "verify":
         return (
-            "APK verification failed.\n\n"
-            f"{error.details or 'Check SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED and SIGN_MIN_SDK_VERSION.'}"
+            "❌ Подписанный APK не прошёл проверку apksigner.\n\n"
+            f"{error.details or 'Проверьте SIGN_V1_ENABLED, SIGN_V2_ENABLED, SIGN_V3_ENABLED и SIGN_MIN_SDK_VERSION.'}"
         )
-    return f"Error at stage '{error.stage}'.\n\n{error.details or 'No details.'}"
+    return f"❌ Ошибка на этапе '{error.stage}'.\n\n{error.details or 'Без деталей.'}"
 
 
 @dp.message(F.document)
