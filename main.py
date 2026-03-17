@@ -128,9 +128,20 @@ PACKAGE_CHOICES = [
 ]
 
 FAKE_STRINGS = [
+    # пермишены
     "android.permission.INTERNET",
     "android.permission.READ_PHONE_STATE",
-    "com.google.firebase.analytics",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.CAMERA",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.USE_BIOMETRIC",
+    # firebase / analytics
+    "com.google.firebase.analytics.FirebaseAnalytics",
+    "com.google.android.gms.analytics.GoogleAnalytics",
+    "com.appsflyer.AppsFlyerLib",
+    "com.amplitude.api.Amplitude",
+    # системные API
     "android.app.NotificationManager",
     "javax.net.ssl.TrustManagerFactory",
     "android.hardware.camera2.CameraManager",
@@ -138,6 +149,29 @@ FAKE_STRINGS = [
     "android.os.Build.VERSION.SDK_INT",
     "android.content.pm.PackageManager",
     "android.telephony.TelephonyManager",
+    "android.app.ActivityManager",
+    "android.content.ContentResolver",
+    "android.provider.Settings.Secure",
+    # intent actions
+    "android.intent.action.MAIN",
+    "android.intent.action.VIEW",
+    "android.intent.action.BOOT_COMPLETED",
+    "android.intent.category.LAUNCHER",
+    # security / сеть
+    "javax.net.ssl.SSLContext",
+    "java.security.MessageDigest",
+    "java.security.KeyStore",
+    # HTTP заголовки (приманка для анализаторов)
+    "X-Requested-With",
+    "Authorization",
+]
+
+FAKE_SMALI_PACKAGES = [
+    "com/analytics/core",
+    "com/util/crypto",
+    "com/net/ssl",
+    "com/security/guard",
+    "com/app/internal",
 ]
 
 dp = Dispatcher()
@@ -374,70 +408,147 @@ def validate_keystore():
         details = combine_process_output(result.stdout, result.stderr).replace(" ", "").lower()
         if "signaturealgorithmname:sha256" not in details:
             raise KeystoreConfigError(
-                "Keystore certificate must use SHA-256. Recreate it with "
-                "'keytool -genkey -sigalg SHA256withRSA ...' or disable "
+                "Сертификат keystore должен использовать SHA-256. Пересоздайте его командой "
+                "'keytool -genkey -sigalg SHA256withRSA ...' или отключите "
                 "REQUIRE_SHA256_KEYSTORE."
             )
 
 
-def xor_encrypt_bytes(text, key):
-    """XOR-encrypt a UTF-8 string with a per-class single-byte key."""
-    return [b ^ key for b in text.encode("utf-8")]
+def xor_encrypt_bytes(text, key_bytes):
+    """XOR-шифрование UTF-8 строки многобайтовым ключом (rolling XOR)."""
+    data = text.encode("utf-8")
+    return [b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(data)]
 
 
-def generate_encrypted_smali(class_name, method_name, fake_string, key):
-    """Return smali source for a class that stores an XOR-encrypted string
-    and exposes a static decrypt() method that reconstructs it at runtime."""
-    encrypted = xor_encrypt_bytes(fake_string, key)
-    length = len(encrypted)
-    byte_data = "\n        ".join(f"0x{b:02x}" for b in encrypted)
-    class_ref = f"Lcom/security/guard/{class_name};"
-    return (
-        f".class public {class_ref}\n"
-        f".super Ljava/lang/Object;\n"
-        f"\n"
-        f".field private static final ENCRYPTED:[B\n"
-        f"\n"
-        f".method static constructor <clinit>()V\n"
-        f"    .registers 2\n"
-        f"    const/16 v0, {length}\n"
-        f"    new-array v0, v0, [B\n"
-        f"    fill-array-data v0, :enc_data\n"
-        f"    sput-object v0, {class_ref}->ENCRYPTED:[B\n"
-        f"    return-void\n"
-        f"\n"
-        f"    :enc_data\n"
-        f"    .array-data 1\n"
-        f"        {byte_data}\n"
-        f"    .end array-data\n"
-        f".end method\n"
-        f"\n"
-        f".method public constructor <init>()V\n"
-        f"    .registers 1\n"
-        f"    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V\n"
-        f"    return-void\n"
-        f".end method\n"
-        f"\n"
-        f"# XOR key: 0x{key:02x}  (per-class, embedded in decrypt method)\n"
-        f".method public static {method_name}()[B\n"
-        f"    .registers 6\n"
-        f"    sget-object v0, {class_ref}->ENCRYPTED:[B\n"
-        f"    array-length v1, v0\n"
-        f"    new-array v2, v1, [B\n"
-        f"    const/4 v3, 0x0\n"
-        f"    const/16 v4, 0x{key:02x}\n"
-        f"    :loop\n"
-        f"    if-ge v3, v1, :end\n"
-        f"    aget-byte v5, v0, v3\n"
-        f"    xor-int/2addr v5, v4\n"
-        f"    int-to-byte v5, v5\n"
-        f"    aput-byte v5, v2, v3\n"
-        f"    add-int/lit8 v3, v3, 0x1\n"
-        f"    goto :loop\n"
-        f"    :end\n"
-        f"    return-object v2\n"
-        f".end method\n"
-    )
+def _smali_array_data(byte_list):
+    """Форматирует список байт для .array-data 1 в smali."""
+    return "\n        ".join(f"0x{b:02x}" for b in byte_list)
+
+
+def generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_package):
+    """
+    Генерирует smali-класс с XOR-зашифрованными строками.
+
+    decrypt_entries : list[(method_name, fake_string)] — по одному методу на строку
+    key_bytes       : list[int] — многобайтовый rolling XOR-ключ
+    smali_package   : str — e.g. 'com/security/guard'
+    """
+    class_ref = f"L{smali_package}/{class_name};"
+    key_len = len(key_bytes)
+
+    # Предвычисляем зашифрованные данные
+    enc_data = [
+        (method_name, xor_encrypt_bytes(fake_string, key_bytes))
+        for method_name, fake_string in decrypt_entries
+    ]
+
+    # --- поля ---
+    field_lines = [".field private static final KEY:[B"]
+    for idx in range(len(enc_data)):
+        field_lines.append(f".field private static final ENCRYPTED_{idx}:[B")
+    fields_block = "\n".join(field_lines)
+
+    # --- <clinit> ---
+    clinit = [
+        ".method static constructor <clinit>()V",
+        "    .registers 1",
+        f"    const/16 v0, {key_len}",
+        "    new-array v0, v0, [B",
+        "    fill-array-data v0, :key_data",
+        f"    sput-object v0, {class_ref}->KEY:[B",
+    ]
+    for idx, (_, enc) in enumerate(enc_data):
+        clinit += [
+            f"    const/16 v0, {len(enc)}",
+            "    new-array v0, v0, [B",
+            f"    fill-array-data v0, :enc_data_{idx}",
+            f"    sput-object v0, {class_ref}->ENCRYPTED_{idx}:[B",
+        ]
+    clinit += [
+        "    return-void",
+        "",
+        "    :key_data",
+        "    .array-data 1",
+        f"        {_smali_array_data(key_bytes)}",
+        "    .end array-data",
+    ]
+    for idx, (_, enc) in enumerate(enc_data):
+        clinit += [
+            f"    :enc_data_{idx}",
+            "    .array-data 1",
+            f"        {_smali_array_data(enc)}",
+            "    .end array-data",
+        ]
+    clinit.append(".end method")
+
+    # --- методы-дешифраторы (rolling XOR по KEY) ---
+    decrypt_blocks = []
+    for idx, (method_name, _) in enumerate(enc_data):
+        m = [
+            f".method public static {method_name}()[B",
+            "    .registers 8",
+            f"    sget-object v0, {class_ref}->ENCRYPTED_{idx}:[B",
+            f"    sget-object v1, {class_ref}->KEY:[B",
+            "    array-length v3, v0",
+            "    array-length v4, v1",
+            "    new-array v2, v3, [B",
+            "    const/4 v5, 0x0",
+            f"    :loop_{method_name}",
+            f"    if-ge v5, v3, :end_{method_name}",
+            "    aget-byte v6, v0, v5",
+            "    rem-int v7, v5, v4",
+            "    aget-byte v7, v1, v7",
+            "    xor-int/2addr v6, v7",
+            "    int-to-byte v6, v6",
+            "    aput-byte v6, v2, v5",
+            "    add-int/lit8 v5, v5, 0x1",
+            f"    goto :loop_{method_name}",
+            f"    :end_{method_name}",
+            "    return-object v2",
+            ".end method",
+        ]
+        decrypt_blocks.append("\n".join(m))
+
+    # --- мусорный метод (dead code, никогда не вызывается) ---
+    junk_name = generate_random_string(6)
+    r1 = random.randint(2, 15)
+    r2 = random.randint(16, 127)
+    r3 = random.randint(1, 7)
+    r4 = random.randint(3, 97)
+    junk = "\n".join([
+        f".method public static {junk_name}(I)I",
+        "    .registers 5",
+        f"    const/16 v0, 0x{r1:02x}",
+        "    mul-int/2addr p0, v0",
+        f"    const/16 v1, 0x{r2:02x}",
+        "    add-int/2addr p0, v1",
+        f"    const/4 v2, 0x{r3:01x}",
+        "    xor-int/2addr p0, v2",
+        f"    const/16 v3, 0x{r4:02x}",
+        "    rem-int p0, p0, v3",
+        "    return p0",
+        ".end method",
+    ])
+
+    return "\n".join([
+        f".class public {class_ref}",
+        ".super Ljava/lang/Object;",
+        "",
+        fields_block,
+        "",
+        ".method public constructor <init>()V",
+        "    .registers 1",
+        f"    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+        "\n".join(clinit),
+        "",
+        "\n\n".join(decrypt_blocks),
+        "",
+        junk,
+        "",
+    ])
 
 
 def inject_security_measures(work_dir):
@@ -458,17 +569,21 @@ def inject_security_measures(work_dir):
         with open(manifest, "w", encoding="utf-8") as file:
             file.write(data)
 
-    fake_package_path = os.path.join(work_dir, "smali", "com", "security", "guard")
-    os.makedirs(fake_package_path, exist_ok=True)
+    for _ in range(10):
+        smali_package = random.choice(FAKE_SMALI_PACKAGES)
+        package_path = os.path.join(work_dir, "smali", *smali_package.split("/"))
+        os.makedirs(package_path, exist_ok=True)
 
-    for _ in range(5):
         class_name = generate_random_string(8)
-        method_name = generate_random_string(6)
-        key = random.randint(1, 255)
-        fake_string = random.choice(FAKE_STRINGS)
+        key_len = random.randint(4, 8)
+        key_bytes = [random.randint(1, 255) for _ in range(key_len)]
+        decrypt_entries = [
+            (generate_random_string(6), random.choice(FAKE_STRINGS)),
+            (generate_random_string(6), random.choice(FAKE_STRINGS)),
+        ]
 
-        smali_content = generate_encrypted_smali(class_name, method_name, fake_string, key)
-        smali_file = os.path.join(fake_package_path, f"{class_name}.smali")
+        smali_content = generate_encrypted_smali(class_name, decrypt_entries, key_bytes, smali_package)
+        smali_file = os.path.join(package_path, f"{class_name}.smali")
         with open(smali_file, "w", encoding="utf-8") as file:
             file.write(smali_content)
 
